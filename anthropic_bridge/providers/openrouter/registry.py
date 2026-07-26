@@ -1,13 +1,8 @@
 from typing import Any
 
-from ..utils import map_reasoning_effort, normalize_model_id
+from ..utils import map_reasoning_effort
 from .base import ProviderResult
 from .grok import GrokProvider
-
-
-def _needs_developer_role(model_id: str) -> bool:
-    lower = normalize_model_id(model_id)
-    return lower.startswith(("o1", "o3", "o4")) or lower.startswith("gpt-5")
 
 
 class ProviderRegistry:
@@ -16,11 +11,17 @@ class ProviderRegistry:
         lower = model_id.lower()
         self._grok = GrokProvider(model_id) if ("grok" in lower or "x-ai/" in lower) else None
         self._is_gemini = "gemini" in lower or "google/" in lower
-        self._is_openai = "openai/" in lower or lower.startswith(("o1", "o3", "o4"))
+        self._is_openai = (
+            "openai" in lower
+            or "gpt-" in lower
+            or lower.startswith(("o1", "o3", "o4"))
+        )
         self._is_deepseek = "deepseek" in lower
         self._is_minimax = "minimax" in lower
         self._is_qwen = "qwen" in lower
-        self._use_developer_role = self._is_openai and _needs_developer_role(model_id)
+        self._use_developer_role = self._is_openai and (
+            "gpt-5" in lower or lower.startswith(("o1", "o3", "o4"))
+        )
 
     def process_text_content(self, text: str, accumulated: str) -> ProviderResult:
         if self._grok:

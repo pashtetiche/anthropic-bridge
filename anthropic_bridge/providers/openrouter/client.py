@@ -25,15 +25,18 @@ OPENROUTER_HEADERS = {
     "HTTP-Referer": "https://github.com/Mng-dev-ai/claudex",
     "X-Title": "Claudex",
 }
+PRESET_PREFIX = "@preset/"
 
 
 class OpenRouterProvider:
     def __init__(self, target_model: str, api_key: str):
         self.target_model = target_model.removeprefix("openrouter/")
+        self.capability_model = self.target_model.removeprefix(PRESET_PREFIX)
         self.api_key = api_key
-        self.provider_registry = ProviderRegistry(self.target_model)
+        self.provider_registry = ProviderRegistry(self.capability_model)
         self._is_gemini = (
-            "gemini" in target_model.lower() or "google/" in target_model.lower()
+            "gemini" in self.capability_model.lower()
+            or "google/" in self.capability_model.lower()
         )
 
     async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
@@ -60,8 +63,26 @@ class OpenRouterProvider:
                 if tool_choice:
                     openrouter_payload["tool_choice"] = tool_choice
 
-            if payload.get("thinking"):
-                openrouter_payload["include_reasoning"] = True
+            EFFORT_MAP = {
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "high",   # у OpenRouter только low/medium/high
+                "max": "high",
+            }
+            output_config = payload.get("output_config") or {}
+            has_format = bool(output_config.get("format"))
+            effort = output_config.get("effort")
+
+            if has_format:
+                pass  # structured-output: reasoning не навязываем, апстрим сам разберётся
+            elif payload.get("thinking"):
+                if effort in EFFORT_MAP:
+                    openrouter_payload["reasoning"] = {"effort": EFFORT_MAP[effort]}
+                else:
+                    openrouter_payload["reasoning"] = {"enabled": True}
+            else:
+                openrouter_payload["reasoning"] = {"enabled": False}
 
             self.provider_registry.prepare_request(openrouter_payload, payload)
 
@@ -81,7 +102,10 @@ class OpenRouterProvider:
         if self._is_gemini:
             self._inject_gemini_reasoning(messages)
 
-        if "grok" in self.target_model.lower() or "x-ai" in self.target_model.lower():
+        if (
+            "grok" in self.capability_model.lower()
+            or "x-ai" in self.capability_model.lower()
+        ):
             instruction = (
                 "IMPORTANT: When calling tools, you MUST use the OpenAI tool_calls format with JSON. "
                 "NEVER use XML format like <xai:function_call>."
@@ -206,6 +230,15 @@ class OpenRouterProvider:
                     if reasoning:
                         for _e in emitter.thinking_delta(reasoning):
                             yield _e
+                    else:
+                        # summary из reasoning_details только если плоского reasoning нет
+                        # (openai дублирует контент в оба поля — избегаем двойного эмита)
+                        for rd in (delta.get("reasoning_details") or []):
+                            if rd.get("type") == "reasoning.summary":
+                                summary_delta = rd.get("summary") or ""
+                                if summary_delta:
+                                    for _e in emitter.thinking_delta(summary_delta):
+                                        yield _e
 
                     if content:
                         for _e in emitter.close_thinking():
