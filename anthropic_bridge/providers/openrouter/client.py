@@ -1,3 +1,4 @@
+import sys, time
 import asyncio
 import json
 from collections.abc import AsyncIterator
@@ -53,6 +54,7 @@ class OpenRouterProvider:
                 "stream": True,
                 "max_tokens": payload.get("max_tokens", 16000),
                 "stream_options": {"include_usage": True},
+                "usage": {"include": True},
             }
 
             if tools:
@@ -153,6 +155,11 @@ class OpenRouterProvider:
         current_reasoning_details: list[dict[str, Any]] = []
         had_error = False
 
+        t0 = time.monotonic()
+        ttft: float | None = None
+        actual_model = ""
+        actual_provider = ""
+
         async with (
             httpx.AsyncClient(timeout=300.0) as client,
             client.stream(
@@ -168,7 +175,14 @@ class OpenRouterProvider:
         ):
             if response.status_code != 200:
                 error_text = await response.aread()
-                for _e in emitter.error_and_finish(error_text.decode(errors="replace")):
+                decoded = error_text.decode(errors="replace")
+                print(
+                    f"[{self.target_model}] HTTP {response.status_code} | "
+                    f"{decoded[:300]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                for _e in emitter.error_and_finish(decoded):
                     yield _e
                 return
 
@@ -192,6 +206,10 @@ class OpenRouterProvider:
                     except json.JSONDecodeError:
                         continue
 
+                    if not actual_model and data.get("model"):
+                        actual_model = data["model"]
+                        actual_provider = data.get("provider") or "?"
+
                     if data.get("error"):
                         had_error = True
                         error = data["error"]
@@ -199,6 +217,11 @@ class OpenRouterProvider:
                             message = error.get("message", "OpenRouter API error")
                         else:
                             message = str(error)
+                        print(
+                            f"[{self.target_model}] stream error | {message}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         yield sse(
                             "error",
                             {
@@ -226,6 +249,9 @@ class OpenRouterProvider:
 
                     reasoning = delta.get("reasoning") or ""
                     content = delta.get("content") or ""
+
+                    if ttft is None and (reasoning or content):
+                        ttft = time.monotonic() - t0
 
                     if reasoning:
                         for _e in emitter.thinking_delta(reasoning):
@@ -317,12 +343,42 @@ class OpenRouterProvider:
                 },
             )
 
+        # --- usage: OpenRouter отдаёт в OpenAI-форме ---
         usage_summary = usage or {}
+        prompt_details = usage_summary.get("prompt_tokens_details") or {}
+        completion_details = usage_summary.get("completion_tokens_details") or {}
+
+        prompt_t = usage_summary.get("prompt_tokens", 0) or 0
+        cached_t = prompt_details.get("cached_tokens", 0) or 0
+        completion_t = usage_summary.get("completion_tokens", 0) or 0
+        reasoning_t = completion_details.get("reasoning_tokens", 0) or 0
+        cost = usage_summary.get("cost")
+
+        hit_rate = f"{cached_t / prompt_t:.0%}" if prompt_t else "—"
+        log_parts = [
+            f"in {prompt_t}",
+            f"cached {cached_t} ({hit_rate})",
+            f"out {completion_t}",
+            f"reason {reasoning_t}",
+            f"ttft {ttft:.1f}s" if ttft is not None else "ttft —",
+            f"total {time.monotonic() - t0:.1f}s",
+        ]
+        if cost is not None:
+            log_parts.append(f"${cost:.5f}")
+
+        print(
+            f"[{self.target_model}] -> {actual_model or '?'} @ "
+            f"{actual_provider or '?'} | " + " | ".join(log_parts),
+            file=sys.stderr,
+            flush=True,
+        )
+
         for _e in emitter.finish({
-            "input_tokens": usage_summary.get("prompt_tokens", 0),
-            "cache_creation_input_tokens": usage_summary.get("cache_creation_input_tokens", 0),
-            "cache_read_input_tokens": usage_summary.get("cache_read_input_tokens", 0),
-            "output_tokens": usage_summary.get("completion_tokens", 0),
+            # Anthropic считает input и кеш раздельно, OpenAI включает cached в prompt
+            "input_tokens": max(prompt_t - cached_t, 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": cached_t,
+            "output_tokens": completion_t,
         }):
             yield _e
 
