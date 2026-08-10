@@ -356,6 +356,7 @@ class OpenRouterProvider:
 
         hit_rate = f"{cached_t / prompt_t:.0%}" if prompt_t else "—"
         log_parts = [
+            time.strftime("%Y-%m-%d %H:%M:%S"),
             f"in {prompt_t}",
             f"cached {cached_t} ({hit_rate})",
             f"out {completion_t}",
