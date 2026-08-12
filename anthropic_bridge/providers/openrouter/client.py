@@ -45,6 +45,10 @@ class OpenRouterProvider:
             self.provider_registry.reset()
 
             messages = self._convert_messages(payload)
+            # print(
+            #     f"[probe] MID={'ponytail' in json.dumps(messages, ensure_ascii=False).lower()}",
+            #     file=sys.stderr, flush=True,
+            # )
             tools = convert_anthropic_tools_to_openai(payload.get("tools"))
 
             openrouter_payload: dict[str, Any] = {
@@ -87,6 +91,9 @@ class OpenRouterProvider:
                 openrouter_payload["reasoning"] = {"enabled": False}
 
             self.provider_registry.prepare_request(openrouter_payload, payload)
+
+            # _out = json.dumps(openrouter_payload, ensure_ascii=False).lower()
+            # print(f"[probe] OUT={'ponytail' in _out}", file=sys.stderr, flush=True)
 
         except Exception as e:
             async for event in yield_error_events(str(e), self.target_model):

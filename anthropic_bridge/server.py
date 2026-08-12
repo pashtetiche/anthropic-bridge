@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal
+# import json
+# import sys
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,6 +57,15 @@ class AnthropicBridge:
         @self.app.post("/v1/messages", response_model=None)
         async def messages(request: Request) -> StreamingResponse | JSONResponse:
             body = await request.json()
+            # for _i, _m in enumerate(body.get("messages", [])):
+            #     _c = _m.get("content")
+                # if "ponytail" in json.dumps(_c, ensure_ascii=False).lower():
+                #     _t = [b.get("type") for b in _c if isinstance(b, dict)] if isinstance(_c, list) else "str"
+                    # print(
+                    #     f"[probe] IN msg#{_i} role={_m.get('role')} blocks={_t}",
+                    #     file=sys.stderr, flush=True,
+                    # )
+            
             model = body.get("model", "")
 
             provider = self._get_provider(model)

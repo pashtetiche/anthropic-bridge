@@ -240,4 +240,9 @@ def convert_anthropic_messages_to_openai(
             else:
                 openai_messages.append({"role": "assistant", "content": content})
 
+        elif role == "system":
+            openai_messages.append(
+                {"role": "system", "content": extract_text_content(content)}
+            )
+
     return openai_messages
