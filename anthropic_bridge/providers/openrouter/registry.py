@@ -60,6 +60,12 @@ class ProviderRegistry:
                     request["reasoning_effort"] = effort
                     reasoning_active = True
                 request.pop("thinking", None)
+            reasoning_obj = request.get("reasoning")
+            if reasoning_obj and (
+                reasoning_obj.get("enabled") is True
+                or (reasoning_obj.get("effort") and reasoning_obj.get("effort") != "none")
+            ):
+                reasoning_active = True
             if reasoning_active:
                 request.pop("temperature", None)
             if self._use_developer_role:

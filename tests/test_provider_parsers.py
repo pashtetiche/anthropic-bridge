@@ -260,3 +260,75 @@ def test_openrouter_inject_gemini_reasoning_deduplicates_cached_entries(
     provider._inject_gemini_reasoning(messages)
 
     assert messages[0]["reasoning_details"] == [{"id": "r1", "type": "reasoning"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("anthropic_payload", "expected_reasoning"),
+    [
+        (
+            {"output_config": {"effort": "max"}},
+            {"effort": "max"},
+        ),
+        (
+            {"output_config": {"effort": "xhigh"}},
+            {"effort": "xhigh"},
+        ),
+        (
+            {"output_config": {"effort": "high"}},
+            {"effort": "high"},
+        ),
+        (
+            {"output_config": {"effort": "medium"}},
+            {"effort": "medium"},
+        ),
+        (
+            {"output_config": {"effort": "low"}},
+            {"effort": "low"},
+        ),
+        (
+            {"output_config": {"effort": "minimal"}},
+            {"effort": "minimal"},
+        ),
+        (
+            {"output_config": {"effort": "none"}},
+            {"effort": "none"},
+        ),
+        (
+            {"thinking": {"type": "enabled", "budget_tokens": 5000}},
+            {"max_tokens": 5000},
+        ),
+        (
+            {"thinking": {"type": "adaptive"}},
+            {"enabled": True},
+        ),
+        (
+            {},
+            {"enabled": False},
+        ),
+    ],
+)
+async def test_openrouter_reasoning_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    anthropic_payload: dict[str, Any],
+    expected_reasoning: dict[str, Any],
+) -> None:
+    captured_body: dict[str, Any] = {}
+
+    async def fake_stream(body: dict[str, Any]) -> AsyncIterator[str]:
+        nonlocal captured_body
+        captured_body = body
+        yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    provider = OpenRouterProvider("openrouter/openai/gpt-5.2", "token")
+    monkeypatch.setattr(provider, "_stream_openrouter", fake_stream)
+
+    payload = {
+        "model": "openrouter/openai/gpt-5.2",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 100,
+        **anthropic_payload,
+    }
+    await collect_events(provider.handle(payload))
+
+    assert captured_body.get("reasoning") == expected_reasoning

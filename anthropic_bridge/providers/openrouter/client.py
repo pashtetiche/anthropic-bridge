@@ -1,6 +1,7 @@
-import sys, time
 import asyncio
 import json
+import sys
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -70,11 +71,13 @@ class OpenRouterProvider:
                     openrouter_payload["tool_choice"] = tool_choice
 
             EFFORT_MAP = {
-                "low": "low",
-                "medium": "medium",
+                "max": "max",
+                "xhigh": "xhigh",
                 "high": "high",
-                "xhigh": "high",   # у OpenRouter только low/medium/high
-                "max": "high",
+                "medium": "medium",
+                "low": "low",
+                "minimal": "minimal",
+                "none": "none",
             }
             output_config = payload.get("output_config") or {}
             has_format = bool(output_config.get("format"))
@@ -82,9 +85,14 @@ class OpenRouterProvider:
 
             if has_format:
                 pass  # structured-output: reasoning не навязываем, апстрим сам разберётся
+            elif effort in EFFORT_MAP:
+                openrouter_payload["reasoning"] = {"effort": EFFORT_MAP[effort]}
             elif payload.get("thinking"):
-                if effort in EFFORT_MAP:
-                    openrouter_payload["reasoning"] = {"effort": EFFORT_MAP[effort]}
+                thinking = payload["thinking"]
+                if isinstance(thinking, dict) and thinking.get("budget_tokens"):
+                    openrouter_payload["reasoning"] = {
+                        "max_tokens": thinking["budget_tokens"]
+                    }
                 else:
                     openrouter_payload["reasoning"] = {"enabled": True}
             else:
