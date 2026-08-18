@@ -369,6 +369,18 @@ class OpenRouterProvider:
         reasoning_t = completion_details.get("reasoning_tokens", 0) or 0
         cost = usage_summary.get("cost")
 
+        reasoning_cfg = payload.get("reasoning") or {}
+        if reasoning_cfg.get("effort"):
+            effort_str = str(reasoning_cfg["effort"])
+        elif reasoning_cfg.get("max_tokens"):
+            effort_str = f"{reasoning_cfg['max_tokens']}t"
+        elif reasoning_cfg.get("enabled") is True:
+            effort_str = "on"
+        elif reasoning_cfg.get("enabled") is False:
+            effort_str = "off"
+        else:
+            effort_str = "—"
+
         hit_rate = f"{cached_t / prompt_t:.0%}" if prompt_t else "—"
         log_parts = [
             time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -376,6 +388,7 @@ class OpenRouterProvider:
             f"cached {cached_t} ({hit_rate})",
             f"out {completion_t}",
             f"reason {reasoning_t}",
+            f"effort {effort_str}",
             f"ttft {ttft:.1f}s" if ttft is not None else "ttft —",
             f"total {time.monotonic() - t0:.1f}s",
         ]
