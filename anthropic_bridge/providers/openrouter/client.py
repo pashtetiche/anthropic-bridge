@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -381,9 +382,18 @@ class OpenRouterProvider:
         else:
             effort_str = "—"
 
+        tools_list = payload.get("tools")
+        if tools_list:
+            tools_json = json.dumps(tools_list, ensure_ascii=False)
+            tools_fp = hashlib.sha256(tools_json.encode()).hexdigest()[:5]
+            tools_str = f"tools {len(tools_list)} [{tools_fp}]"
+        else:
+            tools_str = "tools —"
+
         hit_rate = f"{cached_t / prompt_t:.0%}" if prompt_t else "—"
         log_parts = [
             time.strftime("%Y-%m-%d %H:%M:%S"),
+            tools_str,
             f"in {prompt_t}",
             f"cached {cached_t} ({hit_rate})",
             f"out {completion_t}",
