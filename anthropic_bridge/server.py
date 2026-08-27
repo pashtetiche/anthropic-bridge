@@ -8,6 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .cache import get_reasoning_cache
+from .logging import (
+    extract_client_reasoning_summary,
+    record_request_log,
+    setup_access_logging,
+)
 from .protocol import collect_anthropic_response, estimate_anthropic_input_tokens
 from .providers import CopilotProvider, OpenAIProvider, OpenRouterProvider
 from .providers.openai.auth import auth_file_exists
@@ -30,6 +35,7 @@ class AnthropicBridge:
         self._copilot_clients: dict[str, CopilotProvider] = {}
         self._setup_routes()
         self._setup_cors()
+        setup_access_logging()
         get_reasoning_cache()
 
     def _setup_cors(self) -> None:
@@ -52,6 +58,19 @@ class AnthropicBridge:
         @self.app.post("/v1/messages/count_tokens")
         async def count_tokens(request: Request) -> JSONResponse:
             body = await request.json()
+            model = body.get("model", "")
+            client_reasoning = extract_client_reasoning_summary(body)
+            client_addr = (
+                f"{request.client.host}:{request.client.port}"
+                if request.client
+                else ""
+            )
+            record_request_log(
+                client_addr=client_addr,
+                model=model,
+                client_reasoning=client_reasoning,
+                bridge_reasoning="count_tokens",
+            )
             return JSONResponse({"input_tokens": estimate_anthropic_input_tokens(body)})
 
         @self.app.post("/v1/messages", response_model=None)
@@ -59,17 +78,29 @@ class AnthropicBridge:
             body = await request.json()
             # for _i, _m in enumerate(body.get("messages", [])):
             #     _c = _m.get("content")
-                # if "ponytail" in json.dumps(_c, ensure_ascii=False).lower():
-                #     _t = [b.get("type") for b in _c if isinstance(b, dict)] if isinstance(_c, list) else "str"
-                    # print(
-                    #     f"[probe] IN msg#{_i} role={_m.get('role')} blocks={_t}",
-                    #     file=sys.stderr, flush=True,
-                    # )
-            
+            #     if "ponytail" in json.dumps(_c, ensure_ascii=False).lower():
+            #         _t = [b.get("type") for b in _c if isinstance(b, dict)] if isinstance(_c, list) else "str"
+            #         print(
+            #             f"[probe] IN msg#{_i} role={_m.get('role')} blocks={_t}",
+            #             file=sys.stderr, flush=True,
+            #         )
+
             model = body.get("model", "")
+            client_reasoning = extract_client_reasoning_summary(body)
+            client_addr = (
+                f"{request.client.host}:{request.client.port}"
+                if request.client
+                else ""
+            )
 
             provider = self._get_provider(model)
             if provider is None:
+                record_request_log(
+                    client_addr=client_addr,
+                    model=model,
+                    client_reasoning=client_reasoning,
+                    bridge_reasoning="none (unauthorized)",
+                )
                 return JSONResponse(
                     status_code=401,
                     content={
@@ -79,6 +110,18 @@ class AnthropicBridge:
                         }
                     },
                 )
+
+            bridge_reasoning = (
+                provider.get_reasoning_summary(body)
+                if hasattr(provider, "get_reasoning_summary")
+                else "none"
+            )
+            record_request_log(
+                client_addr=client_addr,
+                model=model,
+                client_reasoning=client_reasoning,
+                bridge_reasoning=bridge_reasoning,
+            )
 
             if body.get("stream") is not True:
                 message, error = await collect_anthropic_response(provider.handle(body))

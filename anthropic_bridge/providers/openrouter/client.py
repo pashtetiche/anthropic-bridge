@@ -21,6 +21,11 @@ from ..utils import (
     sse,
     yield_error_events,
 )
+from .mandatory_reasoning import (
+    is_mandatory_reasoning_error,
+    is_mandatory_reasoning_model,
+    register_mandatory_reasoning_model,
+)
 from .registry import ProviderRegistry
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -41,6 +46,60 @@ class OpenRouterProvider:
             "gemini" in self.capability_model.lower()
             or "google/" in self.capability_model.lower()
         )
+
+    def _determine_reasoning(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        EFFORT_MAP = {
+            "max": "max",
+            "xhigh": "xhigh",
+            "high": "high",
+            "medium": "medium",
+            "low": "low",
+            "minimal": "minimal",
+            "none": "none",
+        }
+        output_config = payload.get("output_config") or {}
+        has_format = bool(output_config.get("format"))
+        effort = output_config.get("effort")
+        thinking = payload.get("thinking")
+
+        is_mandatory = is_mandatory_reasoning_model(
+            self.target_model
+        ) or is_mandatory_reasoning_model(self.capability_model)
+
+        if is_mandatory:
+            if effort in EFFORT_MAP and effort != "none":
+                return {"effort": EFFORT_MAP[effort]}, False
+            if isinstance(thinking, dict) and thinking.get("budget_tokens"):
+                return {"max_tokens": thinking["budget_tokens"]}, False
+            if thinking and isinstance(thinking, dict) and thinking.get("type") != "disabled":
+                return {"enabled": True}, False
+            return {"enabled": True}, True
+
+        if has_format:
+            return None, False
+        if effort in EFFORT_MAP:
+            return {"effort": EFFORT_MAP[effort]}, False
+        if isinstance(thinking, dict) and thinking.get("budget_tokens"):
+            return {"max_tokens": thinking["budget_tokens"]}, False
+        if thinking and isinstance(thinking, dict) and thinking.get("type") != "disabled":
+            return {"enabled": True}, False
+        return {"enabled": False}, False
+
+    def get_reasoning_summary(self, payload: dict[str, Any]) -> str:
+        reasoning, is_forced = self._determine_reasoning(payload)
+        if is_forced:
+            return "enabled=True (forced)"
+        if not reasoning:
+            return "none"
+        if "effort" in reasoning:
+            return f"effort={reasoning['effort']}"
+        if "max_tokens" in reasoning:
+            return f"max_tokens={reasoning['max_tokens']}"
+        if "enabled" in reasoning:
+            return f"enabled={reasoning['enabled']}"
+        return str(reasoning)
 
     async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         try:
@@ -71,33 +130,9 @@ class OpenRouterProvider:
                 if tool_choice:
                     openrouter_payload["tool_choice"] = tool_choice
 
-            EFFORT_MAP = {
-                "max": "max",
-                "xhigh": "xhigh",
-                "high": "high",
-                "medium": "medium",
-                "low": "low",
-                "minimal": "minimal",
-                "none": "none",
-            }
-            output_config = payload.get("output_config") or {}
-            has_format = bool(output_config.get("format"))
-            effort = output_config.get("effort")
-
-            if has_format:
-                pass  # structured-output: reasoning не навязываем, апстрим сам разберётся
-            elif effort in EFFORT_MAP:
-                openrouter_payload["reasoning"] = {"effort": EFFORT_MAP[effort]}
-            elif payload.get("thinking"):
-                thinking = payload["thinking"]
-                if isinstance(thinking, dict) and thinking.get("budget_tokens"):
-                    openrouter_payload["reasoning"] = {
-                        "max_tokens": thinking["budget_tokens"]
-                    }
-                else:
-                    openrouter_payload["reasoning"] = {"enabled": True}
-            else:
-                openrouter_payload["reasoning"] = {"enabled": False}
+            reasoning, _ = self._determine_reasoning(payload)
+            if reasoning is not None:
+                openrouter_payload["reasoning"] = reasoning
 
             self.provider_registry.prepare_request(openrouter_payload, payload)
 
@@ -176,165 +211,176 @@ class OpenRouterProvider:
         actual_model = ""
         actual_provider = ""
 
-        async with (
-            httpx.AsyncClient(timeout=300.0) as client,
-            client.stream(
-                "POST",
-                OPENROUTER_API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                    **OPENROUTER_HEADERS,
-                },
-                json=payload,
-            ) as response,
-        ):
-            if response.status_code != 200:
-                error_text = await response.aread()
-                decoded = error_text.decode(errors="replace")
-                print(
-                    f"[{self.target_model}] HTTP {response.status_code} | "
-                    f"{decoded[:300]}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                for _e in emitter.error_and_finish(decoded):
-                    yield _e
-                return
-
-            buffer = ""
-            async for chunk in response.aiter_text():
-                buffer += chunk
-                lines = buffer.split("\n")
-                buffer = lines.pop()
-
-                for line in lines:
-                    line = line.strip()
-                    if not line or not line.startswith("data: "):
+        for attempt in range(2):
+            async with (
+                httpx.AsyncClient(timeout=300.0) as client,
+                client.stream(
+                    "POST",
+                    OPENROUTER_API_URL,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.api_key}",
+                        **OPENROUTER_HEADERS,
+                    },
+                    json=payload,
+                ) as response,
+            ):
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    decoded = error_text.decode(errors="replace")
+                    print(
+                        f"[{self.target_model}] HTTP {response.status_code} | "
+                        f"{decoded[:300]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if attempt == 0 and is_mandatory_reasoning_error(decoded):
+                        register_mandatory_reasoning_model(self.target_model)
+                        payload["reasoning"] = {"enabled": True}
+                        self.provider_registry.prepare_request(payload, {})
                         continue
 
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        continue
+                    for _e in emitter.error_and_finish(decoded):
+                        yield _e
+                    return
 
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                buffer = ""
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+                    lines = buffer.split("\n")
+                    buffer = lines.pop()
 
-                    if not actual_model and data.get("model"):
-                        actual_model = data["model"]
-                        actual_provider = data.get("provider") or "?"
+                    for line in lines:
+                        line = line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
 
-                    if data.get("error"):
-                        had_error = True
-                        error = data["error"]
-                        if isinstance(error, dict):
-                            message = error.get("message", "OpenRouter API error")
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            continue
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if not actual_model and data.get("model"):
+                            actual_model = data["model"]
+                            actual_provider = data.get("provider") or "?"
+
+                        if data.get("error"):
+                            had_error = True
+                            error = data["error"]
+                            if isinstance(error, dict):
+                                message = error.get("message", "OpenRouter API error")
+                            else:
+                                message = str(error)
+                            if is_mandatory_reasoning_error(message):
+                                register_mandatory_reasoning_model(self.target_model)
+                            print(
+                                f"[{self.target_model}] stream error | {message}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            yield sse(
+                                "error",
+                                {
+                                    "type": "error",
+                                    "error": {"type": "api_error", "message": message},
+                                },
+                            )
+                            continue
+
+                        if data.get("usage"):
+                            usage = data["usage"]
+
+                        choice = first_choice(data)
+                        if choice is None:
+                            continue
+
+                        delta = choice.get("delta", {})
+                        if not isinstance(delta, dict):
+                            delta = {}
+
+                        if self._is_gemini and delta.get("reasoning_details"):
+                            self._append_unique_reasoning_details(
+                                current_reasoning_details, delta["reasoning_details"]
+                            )
+
+                        reasoning = delta.get("reasoning") or ""
+                        content = delta.get("content") or ""
+
+                        if ttft is None and (reasoning or content):
+                            ttft = time.monotonic() - t0
+
+                        if reasoning:
+                            for _e in emitter.thinking_delta(reasoning):
+                                yield _e
                         else:
-                            message = str(error)
-                        print(
-                            f"[{self.target_model}] stream error | {message}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        yield sse(
-                            "error",
-                            {
-                                "type": "error",
-                                "error": {"type": "api_error", "message": message},
-                            },
-                        )
-                        continue
+                            # summary из reasoning_details только если плоского reasoning нет
+                            # (openai дублирует контент в оба поля — избегаем двойного эмита)
+                            for rd in (delta.get("reasoning_details") or []):
+                                if rd.get("type") == "reasoning.summary":
+                                    summary_delta = rd.get("summary") or ""
+                                    if summary_delta:
+                                        for _e in emitter.thinking_delta(summary_delta):
+                                            yield _e
 
-                    if data.get("usage"):
-                        usage = data["usage"]
-
-                    choice = first_choice(data)
-                    if choice is None:
-                        continue
-
-                    delta = choice.get("delta", {})
-                    if not isinstance(delta, dict):
-                        delta = {}
-
-                    if self._is_gemini and delta.get("reasoning_details"):
-                        self._append_unique_reasoning_details(
-                            current_reasoning_details, delta["reasoning_details"]
-                        )
-
-                    reasoning = delta.get("reasoning") or ""
-                    content = delta.get("content") or ""
-
-                    if ttft is None and (reasoning or content):
-                        ttft = time.monotonic() - t0
-
-                    if reasoning:
-                        for _e in emitter.thinking_delta(reasoning):
-                            yield _e
-                    else:
-                        # summary из reasoning_details только если плоского reasoning нет
-                        # (openai дублирует контент в оба поля — избегаем двойного эмита)
-                        for rd in (delta.get("reasoning_details") or []):
-                            if rd.get("type") == "reasoning.summary":
-                                summary_delta = rd.get("summary") or ""
-                                if summary_delta:
-                                    for _e in emitter.thinking_delta(summary_delta):
-                                        yield _e
-
-                    if content:
-                        for _e in emitter.close_thinking():
-                            yield _e
-
-                        result = self.provider_registry.process_text_content(content, "")
-                        clean_text = result.cleaned_text
-
-                        if clean_text:
-                            for _e in emitter.text_delta(clean_text):
+                        if content:
+                            for _e in emitter.close_thinking():
                                 yield _e
 
-                        for tc in result.extracted_tool_calls:
-                            for _e in emitter.close_text():
-                                yield _e
-                            for _e in emitter.add_tool(tc.id, tc.id, tc.name):
-                                yield _e
-                            for _e in emitter.tool_delta(tc.id, json.dumps(tc.arguments)):
-                                yield _e
-                            for _e in emitter.close_tool(tc.id):
-                                yield _e
-                            if self._is_gemini and current_reasoning_details:
-                                get_reasoning_cache().set(
-                                    tc.id, current_reasoning_details.copy()
-                                )
+                            result = self.provider_registry.process_text_content(content, "")
+                            clean_text = result.cleaned_text
 
-                    tool_calls = delta.get("tool_calls", [])
-                    for tc in tool_calls:
-                        idx = tc.get("index", 0)
-                        if emitter.get_tool(idx) is None:
-                            tool_id = tc.get("id") or f"tool_{idx}"
-                            for _e in emitter.register_tool(idx, tool_id):
-                                yield _e
+                            if clean_text:
+                                for _e in emitter.text_delta(clean_text):
+                                    yield _e
 
-                        fn = tc.get("function", {})
-                        if fn.get("name"):
-                            for _e in emitter.start_tool(idx, fn["name"]):
-                                yield _e
+                            for tc in result.extracted_tool_calls:
+                                for _e in emitter.close_text():
+                                    yield _e
+                                for _e in emitter.add_tool(tc.id, tc.id, tc.name):
+                                    yield _e
+                                for _e in emitter.tool_delta(tc.id, json.dumps(tc.arguments)):
+                                    yield _e
+                                for _e in emitter.close_tool(tc.id):
+                                    yield _e
+                                if self._is_gemini and current_reasoning_details:
+                                    get_reasoning_cache().set(
+                                        tc.id, current_reasoning_details.copy()
+                                    )
 
-                        tool_entry = emitter.get_tool(idx)
-                        if fn.get("arguments") and tool_entry and tool_entry["started"]:
-                            for _e in emitter.tool_delta(idx, fn["arguments"]):
-                                yield _e
+                        tool_calls = delta.get("tool_calls", [])
+                        for tc in tool_calls:
+                            idx = tc.get("index", 0)
+                            if emitter.get_tool(idx) is None:
+                                tool_id = tc.get("id") or f"tool_{idx}"
+                                for _e in emitter.register_tool(idx, tool_id):
+                                    yield _e
 
-                    finish = choice.get("finish_reason")
-                    if finish == "tool_calls":
-                        for key in emitter.tool_keys:
-                            for _e in emitter.close_tool(key):
-                                yield _e
-                            t = emitter.get_tool(key)
-                            if t and self._is_gemini and current_reasoning_details:
-                                get_reasoning_cache().set(
-                                    t["id"], current_reasoning_details.copy()
-                                )
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                for _e in emitter.start_tool(idx, fn["name"]):
+                                    yield _e
+
+                            tool_entry = emitter.get_tool(idx)
+                            if fn.get("arguments") and tool_entry and tool_entry["started"]:
+                                for _e in emitter.tool_delta(idx, fn["arguments"]):
+                                    yield _e
+
+                        finish = choice.get("finish_reason")
+                        if finish == "tool_calls":
+                            for key in emitter.tool_keys:
+                                for _e in emitter.close_tool(key):
+                                    yield _e
+                                t = emitter.get_tool(key)
+                                if t and self._is_gemini and current_reasoning_details:
+                                    get_reasoning_cache().set(
+                                        t["id"], current_reasoning_details.copy()
+                                    )
+
+                break
 
         # Cache reasoning details for tools closed at stream end
         if self._is_gemini and current_reasoning_details:

@@ -48,6 +48,17 @@ class CopilotProvider:
             return False
         return True
 
+    def get_reasoning_summary(self, payload: dict[str, Any]) -> str:
+        if payload.get("thinking"):
+            budget = payload["thinking"].get("budget_tokens", 0)
+            if "claude" in self.target_model.lower():
+                return f"budget={budget or 4000}"
+            if self._supports_reasoning():
+                effort = map_reasoning_effort(budget, self.target_model) or "medium"
+                return f"effort={effort}"
+            return "enabled"
+        return "none"
+
     async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         token = self._get_token()
         if not token:

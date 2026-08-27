@@ -457,3 +457,36 @@ async def test_sse_parser_round_trips_events() -> None:
         ("ping", {"type": "ping"}),
         ("message_stop", {"type": "message_stop"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_server_records_request_log_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    from anthropic_bridge.logging import clear_request_logs, pop_request_log
+
+    clear_request_logs()
+
+    class FakeProviderWithReasoning(FakeProvider):
+        def get_reasoning_summary(self, payload: dict[str, Any]) -> str:
+            return "enabled=True (forced)"
+
+    bridge = AnthropicBridge(ProxyConfig())
+    monkeypatch.setattr(
+        bridge,
+        "_get_provider",
+        lambda model: FakeProviderWithReasoning([message_start_event(), ("message_stop", {"type": "message_stop"})]),
+    )
+
+    response = await post_message(
+        bridge.app,
+        {
+            "model": "@preset/glm-5-3-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {"type": "disabled"},
+        },
+    )
+
+    assert response.status_code == 200
+    details = pop_request_log()
+    assert "model: @preset/glm-5-3-flash" in details
+    assert "client reasoning: disabled" in details
+    assert "bridge reasoning: enabled=True (forced)" in details

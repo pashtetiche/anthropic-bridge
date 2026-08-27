@@ -3,6 +3,7 @@ import os
 
 import uvicorn
 
+from .logging import setup_access_logging
 from .server import create_app
 
 
@@ -14,6 +15,8 @@ def main() -> None:
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     copilot_token = os.environ.get("GITHUB_COPILOT_TOKEN", "")
+
+    log_config = setup_access_logging()
 
     app = create_app(
         openrouter_api_key=api_key or None,
@@ -30,7 +33,7 @@ def main() -> None:
         print("  OpenRouter: openrouter/* models")
     else:
         print("  OpenRouter: disabled (set OPENROUTER_API_KEY)")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", log_config=log_config)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,16 @@ class OpenAIProvider:
                     return False
         return False
 
+    def get_reasoning_summary(self, payload: dict[str, Any]) -> str:
+        if payload.get("thinking"):
+            effort = map_reasoning_effort(
+                payload["thinking"].get("budget_tokens"), self.target_model
+            )
+            if effort:
+                return f"effort={effort}"
+            return "enabled"
+        return "none"
+
     async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         try:
             self._access_token, self._account_id, self._expires_at = await get_auth(
