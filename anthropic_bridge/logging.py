@@ -44,6 +44,38 @@ def record_request_log(
     _recent_details.append(details)
 
 
+def update_last_request_log(
+    bridge_reasoning: str,
+    client_addr: str | None = None,
+) -> None:
+    if client_addr and client_addr in _details_by_client:
+        current = _details_by_client[client_addr]
+        if " | bridge reasoning: " in current:
+            prefix = current.rsplit(" | bridge reasoning: ", 1)[0]
+            updated = f"{prefix} | bridge reasoning: {bridge_reasoning}"
+        else:
+            updated = f"{current} | bridge reasoning: {bridge_reasoning}"
+        _details_by_client[client_addr] = updated
+        try:
+            idx = _recent_details.index(current)
+            _recent_details[idx] = updated
+        except ValueError:
+            pass
+        return
+
+    if _recent_details:
+        current = _recent_details[-1]
+        if " | bridge reasoning: " in current:
+            prefix = current.rsplit(" | bridge reasoning: ", 1)[0]
+            updated = f"{prefix} | bridge reasoning: {bridge_reasoning}"
+        else:
+            updated = f"{current} | bridge reasoning: {bridge_reasoning}"
+        _recent_details[-1] = updated
+        for k, v in list(_details_by_client.items()):
+            if v == current:
+                _details_by_client[k] = updated
+
+
 def pop_request_log(client_addr: str | None = None) -> str:
     if client_addr and client_addr in _details_by_client:
         details = _details_by_client.pop(client_addr)

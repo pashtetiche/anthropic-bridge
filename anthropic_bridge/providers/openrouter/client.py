@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from ...cache import get_reasoning_cache
+from ...logging import update_last_request_log
 from ...transform import (
     convert_anthropic_messages_to_openai,
     convert_anthropic_tool_choice_to_openai,
@@ -74,8 +75,8 @@ class OpenRouterProvider:
             if isinstance(thinking, dict) and thinking.get("budget_tokens"):
                 return {"max_tokens": thinking["budget_tokens"]}, False
             if thinking and isinstance(thinking, dict) and thinking.get("type") != "disabled":
-                return {"enabled": True}, False
-            return {"enabled": True}, True
+                return {"effort": "low"}, False
+            return {"effort": "low"}, True
 
         if has_format:
             return None, False
@@ -89,17 +90,17 @@ class OpenRouterProvider:
 
     def get_reasoning_summary(self, payload: dict[str, Any]) -> str:
         reasoning, is_forced = self._determine_reasoning(payload)
-        if is_forced:
-            return "enabled=True (forced)"
         if not reasoning:
             return "none"
         if "effort" in reasoning:
-            return f"effort={reasoning['effort']}"
-        if "max_tokens" in reasoning:
-            return f"max_tokens={reasoning['max_tokens']}"
-        if "enabled" in reasoning:
-            return f"enabled={reasoning['enabled']}"
-        return str(reasoning)
+            summary = f"effort={reasoning['effort']}"
+        elif "max_tokens" in reasoning:
+            summary = f"max_tokens={reasoning['max_tokens']}"
+        elif "enabled" in reasoning:
+            summary = f"enabled={reasoning['enabled']}"
+        else:
+            summary = str(reasoning)
+        return f"{summary} (forced)" if is_forced else summary
 
     async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         try:
@@ -236,8 +237,9 @@ class OpenRouterProvider:
                     )
                     if attempt == 0 and is_mandatory_reasoning_error(decoded):
                         register_mandatory_reasoning_model(self.target_model)
-                        payload["reasoning"] = {"enabled": True}
+                        payload["reasoning"] = {"effort": "low"}
                         self.provider_registry.prepare_request(payload, {})
+                        update_last_request_log("effort=low (forced)")
                         continue
 
                     for _e in emitter.error_and_finish(decoded):

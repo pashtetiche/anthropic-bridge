@@ -8,7 +8,9 @@ import pytest
 from anthropic_bridge.logging import (
     BridgeAccessFormatter,
     extract_client_reasoning_summary,
+    pop_request_log,
     record_request_log,
+    update_last_request_log,
 )
 from anthropic_bridge.providers.openrouter.client import OpenRouterProvider
 from anthropic_bridge.providers.openrouter.mandatory_reasoning import (
@@ -103,7 +105,7 @@ async def test_mandatory_reasoning_forces_enabled_when_client_disables(
             }
         )
     )
-    assert captured_payload.get("reasoning") == {"enabled": True}
+    assert captured_payload.get("reasoning") == {"effort": "low"}
 
     # 2. Explicit thinking disabled
     await collect_events(
@@ -115,7 +117,7 @@ async def test_mandatory_reasoning_forces_enabled_when_client_disables(
             }
         )
     )
-    assert captured_payload.get("reasoning") == {"enabled": True}
+    assert captured_payload.get("reasoning") == {"effort": "low"}
 
     # 3. Explicit effort none
     await collect_events(
@@ -127,7 +129,7 @@ async def test_mandatory_reasoning_forces_enabled_when_client_disables(
             }
         )
     )
-    assert captured_payload.get("reasoning") == {"enabled": True}
+    assert captured_payload.get("reasoning") == {"effort": "low"}
 
     # 4. Explicit effort high should be preserved
     await collect_events(
@@ -202,6 +204,13 @@ async def test_stream_openrouter_auto_recovers_from_400_mandatory_error(
         FakeClient,
     )
 
+    record_request_log(
+        client_addr="127.0.0.1:58560",
+        model="openrouter/@preset/glm-5-3-flash",
+        client_reasoning="none",
+        bridge_reasoning="enabled=False",
+    )
+
     provider = OpenRouterProvider("openrouter/@preset/glm-5-3-flash", "token")
     events = await collect_events(
         provider.handle(
@@ -216,7 +225,7 @@ async def test_stream_openrouter_auto_recovers_from_400_mandatory_error(
     assert attempts == 2
     assert is_mandatory_reasoning_model("@preset/glm-5-3-flash")
     assert captured_payloads[0].get("reasoning") == {"enabled": False}
-    assert captured_payloads[1].get("reasoning") == {"enabled": True}
+    assert captured_payloads[1].get("reasoning") == {"effort": "low"}
 
     assert any(
         event == "content_block_delta"
@@ -224,6 +233,10 @@ async def test_stream_openrouter_auto_recovers_from_400_mandatory_error(
         and data["delta"].get("text") == "Success"
         for event, data in events
     )
+
+    # Verify log entry was updated to effort=low (forced)
+    log_details = pop_request_log("127.0.0.1:58560")
+    assert "bridge reasoning: effort=low (forced)" in log_details
 
 
 def test_access_logger_formats_model_and_reasoning() -> None:
@@ -236,7 +249,7 @@ def test_access_logger_formats_model_and_reasoning() -> None:
         client_addr=client_addr,
         model="@preset/glm-5-3-flash",
         client_reasoning="none",
-        bridge_reasoning="enabled=True (forced)",
+        bridge_reasoning="effort=low (forced)",
     )
 
     record = logging.LogRecord(
@@ -253,8 +266,20 @@ def test_access_logger_formats_model_and_reasoning() -> None:
     assert (
         formatted
         == 'INFO:     127.0.0.1:40332 - "POST /v1/messages?beta=true HTTP/1.1" 200 OK | '
-        "model: @preset/glm-5-3-flash | client reasoning: none | bridge reasoning: enabled=True (forced)"
+        "model: @preset/glm-5-3-flash | client reasoning: none | bridge reasoning: effort=low (forced)"
     )
+
+
+def test_update_last_request_log() -> None:
+    record_request_log(
+        client_addr="1.2.3.4:1234",
+        model="test-model",
+        client_reasoning="none",
+        bridge_reasoning="enabled=False",
+    )
+    update_last_request_log("effort=low (forced)", client_addr="1.2.3.4:1234")
+    log = pop_request_log("1.2.3.4:1234")
+    assert log == "model: test-model | client reasoning: none | bridge reasoning: effort=low (forced)"
 
 
 def test_extract_client_reasoning_summary() -> None:

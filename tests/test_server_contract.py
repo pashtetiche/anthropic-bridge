@@ -467,7 +467,7 @@ async def test_server_records_request_log_details(monkeypatch: pytest.MonkeyPatc
 
     class FakeProviderWithReasoning(FakeProvider):
         def get_reasoning_summary(self, payload: dict[str, Any]) -> str:
-            return "enabled=True (forced)"
+            return "effort=low (forced)"
 
     bridge = AnthropicBridge(ProxyConfig())
     monkeypatch.setattr(
@@ -489,4 +489,4 @@ async def test_server_records_request_log_details(monkeypatch: pytest.MonkeyPatc
     details = pop_request_log()
     assert "model: @preset/glm-5-3-flash" in details
     assert "client reasoning: disabled" in details
-    assert "bridge reasoning: enabled=True (forced)" in details
+    assert "bridge reasoning: effort=low (forced)" in details
