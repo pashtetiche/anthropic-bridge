@@ -7,6 +7,7 @@ from anthropic_bridge.providers.copilot.client import CopilotProvider
 from anthropic_bridge.providers.openai.client import OpenAIProvider
 from anthropic_bridge.providers.openrouter.client import OpenRouterProvider
 from anthropic_bridge.providers.responses_api import stream_responses_api
+from anthropic_bridge.providers.utils import classify_upstream_error, is_transient_error
 
 from .conftest import collect_events, fake_client_factory
 
@@ -332,3 +333,182 @@ async def test_openrouter_reasoning_mapping(
     await collect_events(provider.handle(payload))
 
     assert captured_body.get("reasoning") == expected_reasoning
+
+
+def test_classify_upstream_error_and_is_transient() -> None:
+    assert is_transient_error(429, "Rate limit exceeded")
+    assert is_transient_error(503, "Service unavailable")
+    assert is_transient_error(200, "qwen/qwen3.8-flash is temporarily rate-limited upstream")
+    assert not is_transient_error(400, "Bad Request")
+    assert not is_transient_error(401, "Unauthorized")
+
+    err_type, msg = classify_upstream_error(429, '{"error":{"message":"Rate limit","code":429}}')
+    assert err_type == "rate_limit_error"
+    assert msg == "Rate limit"
+
+    err_type, msg = classify_upstream_error(
+        429,
+        '{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"temporarily rate-limited"}}}',
+    )
+    assert err_type == "rate_limit_error"
+    assert msg == "temporarily rate-limited"
+
+    err_type, msg = classify_upstream_error(401, '{"error":{"message":"Invalid token"}}')
+    assert err_type == "authentication_error"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_recovers_from_transient_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class FakeResponse:
+        def __init__(self, status_code: int, chunks: list[str], error_body: bytes = b""):
+            self.status_code = status_code
+            self._chunks = chunks
+            self._error_body = error_body
+
+        async def aread(self) -> bytes:
+            return self._error_body
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            for chunk in self._chunks:
+                yield chunk
+
+        async def __aenter__(self) -> "FakeResponse":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return FakeResponse(
+                    429,
+                    [],
+                    b'{"error":{"message":"Temporarily rate-limited upstream","code":429}}',
+                )
+            return FakeResponse(
+                200,
+                [
+                    'data: {"choices":[{"index":0,"delta":{"content":"Success after retry","role":"assistant"},"finish_reason":"stop"}]}\n\n',
+                    "data: [DONE]\n\n",
+                ],
+            )
+
+    async def noop_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.httpx.AsyncClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.asyncio.sleep",
+        noop_sleep,
+    )
+
+    provider = OpenRouterProvider("openrouter/qwen/qwen3.8-flash", "token")
+    events = await collect_events(
+        provider.handle(
+            {
+                "model": "openrouter/qwen/qwen3.8-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
+    )
+
+    assert attempts == 2
+    assert ("message_stop", {"type": "message_stop"}) in events
+    assert any(
+        event == "content_block_delta"
+        and data["delta"].get("text") == "Success after retry"
+        for event, data in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_exhausts_transient_429_returns_rate_limit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class FakeResponse:
+        def __init__(self, status_code: int, chunks: list[str], error_body: bytes = b""):
+            self.status_code = status_code
+            self._chunks = chunks
+            self._error_body = error_body
+
+        async def aread(self) -> bytes:
+            return self._error_body
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            for chunk in self._chunks:
+                yield chunk
+
+        async def __aenter__(self) -> "FakeResponse":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            return FakeResponse(
+                429,
+                [],
+                b'{"error":{"message":"Rate limit exceeded","code":429}}',
+            )
+
+    async def noop_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.httpx.AsyncClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.asyncio.sleep",
+        noop_sleep,
+    )
+
+    provider = OpenRouterProvider("openrouter/qwen/qwen3.8-flash", "token")
+    events = await collect_events(
+        provider.handle(
+            {
+                "model": "openrouter/qwen/qwen3.8-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
+    )
+
+    # 1 initial + 1 transient retry = 2 attempts total
+    assert attempts == 2
+    error_events = [data for event, data in events if event == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["error"]["type"] == "rate_limit_error"
+    assert error_events[0]["error"]["message"] == "Rate limit exceeded"

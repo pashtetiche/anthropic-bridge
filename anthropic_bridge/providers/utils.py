@@ -64,7 +64,7 @@ def estimate_input_tokens(
 
 
 async def yield_error_events(
-    message: str, model: str
+    message: str, model: str, error_type: str = "api_error"
 ) -> AsyncIterator[str]:
     msg_id = f"msg_{int(time.time())}_{random_id()}"
     yield sse(
@@ -85,7 +85,7 @@ async def yield_error_events(
     )
     yield sse(
         "error",
-        {"type": "error", "error": {"type": "api_error", "message": message}},
+        {"type": "error", "error": {"type": error_type, "message": message}},
     )
     yield sse(
         "message_delta",
@@ -335,11 +335,69 @@ class AnthropicSSEEmitter:
         events.append(sse("message_stop", {"type": "message_stop"}))
         return events
 
-    def error_and_finish(self, message: str) -> list[str]:
+    def error_and_finish(
+        self, message: str, error_type: str = "api_error"
+    ) -> list[str]:
         return [
             sse("error", {
                 "type": "error",
-                "error": {"type": "api_error", "message": message},
+                "error": {"type": error_type, "message": message},
             }),
             *self.finish(dict(DEFAULT_USAGE)),
         ]
+
+
+def is_transient_error(status_code: int | None, error_text: str) -> bool:
+    """Determine if an upstream error is temporary and can be safely retried."""
+    if status_code in (429, 502, 503, 504, 529):
+        return True
+    lower = error_text.lower()
+    return (
+        "rate-limit" in lower
+        or "rate limited" in lower
+        or "rate_limited" in lower
+        or "temporarily rate-limited" in lower
+        or "retry shortly" in lower
+    )
+
+
+def classify_upstream_error(
+    status_code: int | None, error_text: str
+) -> tuple[str, str]:
+    """Extract error type and clean message from upstream status code and response body."""
+    error_type = "api_error"
+    clean_message = error_text
+
+    try:
+        data = json.loads(error_text)
+        if isinstance(data, dict) and "error" in data:
+            err_data = data["error"]
+            if isinstance(err_data, dict):
+                clean_message = err_data.get("message") or error_text
+                raw_meta = err_data.get("metadata", {}).get("raw")
+                if raw_meta and isinstance(raw_meta, str):
+                    clean_message = raw_meta
+            elif isinstance(err_data, str):
+                clean_message = err_data
+    except Exception:
+        pass
+
+    lower_msg = clean_message.lower()
+    if (
+        status_code == 429
+        or ("rate" in lower_msg and "limit" in lower_msg)
+        or "retry shortly" in lower_msg
+    ):
+        error_type = "rate_limit_error"
+    elif status_code in (503, 529) and "overload" in lower_msg:
+        error_type = "overloaded_error"
+    elif status_code == 400:
+        error_type = "invalid_request_error"
+    elif (
+        status_code in (401, 403)
+        or "unauthorized" in lower_msg
+        or "authentication" in lower_msg
+    ):
+        error_type = "authentication_error"
+
+    return error_type, clean_message

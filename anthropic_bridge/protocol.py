@@ -131,6 +131,14 @@ async def collect_anthropic_response(
                         "message": raw_error.get("message", "Upstream provider error"),
                     },
                 }
+            elif isinstance(raw_error, str):
+                error = {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": raw_error,
+                    },
+                }
 
     if message is None:
         return None, error

@@ -126,7 +126,22 @@ class AnthropicBridge:
             if body.get("stream") is not True:
                 message, error = await collect_anthropic_response(provider.handle(body))
                 if error:
-                    return JSONResponse(status_code=502, content=error)
+                    err_obj = error.get("error", {})
+                    err_type = (
+                        err_obj.get("type", "api_error")
+                        if isinstance(err_obj, dict)
+                        else "api_error"
+                    )
+                    status_code = 502
+                    if err_type == "rate_limit_error":
+                        status_code = 429
+                    elif err_type == "overloaded_error":
+                        status_code = 529
+                    elif err_type == "invalid_request_error":
+                        status_code = 400
+                    elif err_type == "authentication_error":
+                        status_code = 401
+                    return JSONResponse(status_code=status_code, content=error)
                 if message is None:
                     return JSONResponse(
                         status_code=502,

@@ -196,6 +196,36 @@ async def test_non_stream_errors_return_json_error(
 
 
 @pytest.mark.asyncio
+async def test_non_stream_rate_limit_error_returns_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = bridge_with_events(
+        monkeypatch,
+        message_start_event(),
+        (
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "Rate limit exceeded",
+                },
+            },
+        ),
+        ("message_stop", {"type": "message_stop"}),
+    )
+
+    response = await post_message(
+        bridge.app,
+        {"model": FAKE_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "rate_limit_error"
+    assert response.json()["error"]["message"] == "Rate limit exceeded"
+
+
+@pytest.mark.asyncio
 async def test_stream_messages_keep_sse(monkeypatch: pytest.MonkeyPatch) -> None:
     bridge = bridge_with_events(
         monkeypatch,

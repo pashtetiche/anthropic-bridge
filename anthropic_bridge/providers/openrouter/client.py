@@ -17,8 +17,10 @@ from ...transform import (
 )
 from ..utils import (
     AnthropicSSEEmitter,
+    classify_upstream_error,
     estimate_input_tokens,
     first_choice,
+    is_transient_error,
     sse,
     yield_error_events,
 )
@@ -212,177 +214,231 @@ class OpenRouterProvider:
         actual_model = ""
         actual_provider = ""
 
-        for attempt in range(2):
-            async with (
-                httpx.AsyncClient(timeout=300.0) as client,
-                client.stream(
-                    "POST",
-                    OPENROUTER_API_URL,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.api_key}",
-                        **OPENROUTER_HEADERS,
-                    },
-                    json=payload,
-                ) as response,
-            ):
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    decoded = error_text.decode(errors="replace")
-                    print(
-                        f"[{self.target_model}] HTTP {response.status_code} | "
-                        f"{decoded[:300]}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    if attempt == 0 and is_mandatory_reasoning_error(decoded):
-                        register_mandatory_reasoning_model(self.target_model)
-                        payload["reasoning"] = {"effort": "low"}
-                        self.provider_registry.prepare_request(payload, {})
-                        update_last_request_log("effort=low (forced)")
-                        continue
+        max_transient_retries = 1
+        transient_retries = 0
+        reasoning_retried = False
 
-                    for _e in emitter.error_and_finish(decoded):
-                        yield _e
-                    return
-
-                buffer = ""
-                async for chunk in response.aiter_text():
-                    buffer += chunk
-                    lines = buffer.split("\n")
-                    buffer = lines.pop()
-
-                    for line in lines:
-                        line = line.strip()
-                        if not line or not line.startswith("data: "):
+        while True:
+            try:
+                async with (
+                    httpx.AsyncClient(timeout=300.0) as client,
+                    client.stream(
+                        "POST",
+                        OPENROUTER_API_URL,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.api_key}",
+                            **OPENROUTER_HEADERS,
+                        },
+                        json=payload,
+                    ) as response,
+                ):
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        decoded = error_text.decode(errors="replace")
+                        print(
+                            f"[{self.target_model}] HTTP {response.status_code} | "
+                            f"{decoded[:300]}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        if not reasoning_retried and is_mandatory_reasoning_error(decoded):
+                            reasoning_retried = True
+                            register_mandatory_reasoning_model(self.target_model)
+                            payload["reasoning"] = {"effort": "low"}
+                            self.provider_registry.prepare_request(payload, {})
+                            update_last_request_log("effort=low (forced)")
                             continue
 
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            continue
-
-                        try:
-                            data = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-
-                        if not actual_model and data.get("model"):
-                            actual_model = data["model"]
-                            actual_provider = data.get("provider") or "?"
-
-                        if data.get("error"):
-                            had_error = True
-                            error = data["error"]
-                            if isinstance(error, dict):
-                                message = error.get("message", "OpenRouter API error")
-                            else:
-                                message = str(error)
-                            if is_mandatory_reasoning_error(message):
-                                register_mandatory_reasoning_model(self.target_model)
+                        if transient_retries < max_transient_retries and is_transient_error(
+                            response.status_code, decoded
+                        ):
+                            transient_retries += 1
+                            backoff = 2.0
                             print(
-                                f"[{self.target_model}] stream error | {message}",
+                                f"[{self.target_model}] Transient HTTP {response.status_code}, retrying in {backoff}s...",
                                 file=sys.stderr,
                                 flush=True,
                             )
-                            yield sse(
-                                "error",
-                                {
-                                    "type": "error",
-                                    "error": {"type": "api_error", "message": message},
-                                },
-                            )
+                            await asyncio.sleep(backoff)
                             continue
 
-                        if data.get("usage"):
-                            usage = data["usage"]
+                        error_type, clean_message = classify_upstream_error(
+                            response.status_code, decoded
+                        )
+                        for _e in emitter.error_and_finish(
+                            clean_message, error_type=error_type
+                        ):
+                            yield _e
+                        return
 
-                        choice = first_choice(data)
-                        if choice is None:
-                            continue
+                    buffer = ""
+                    async for chunk in response.aiter_text():
+                        buffer += chunk
+                        lines = buffer.split("\n")
+                        buffer = lines.pop()
 
-                        delta = choice.get("delta", {})
-                        if not isinstance(delta, dict):
-                            delta = {}
+                        for line in lines:
+                            line = line.strip()
+                            if not line or not line.startswith("data: "):
+                                continue
 
-                        if self._is_gemini and delta.get("reasoning_details"):
-                            self._append_unique_reasoning_details(
-                                current_reasoning_details, delta["reasoning_details"]
-                            )
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                continue
 
-                        reasoning = delta.get("reasoning") or ""
-                        content = delta.get("content") or ""
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                        if ttft is None and (reasoning or content):
-                            ttft = time.monotonic() - t0
+                            if not actual_model and data.get("model"):
+                                actual_model = data["model"]
+                                actual_provider = data.get("provider") or "?"
 
-                        if reasoning:
-                            for _e in emitter.thinking_delta(reasoning):
-                                yield _e
-                        else:
-                            # summary из reasoning_details только если плоского reasoning нет
-                            # (openai дублирует контент в оба поля — избегаем двойного эмита)
-                            for rd in (delta.get("reasoning_details") or []):
-                                if rd.get("type") == "reasoning.summary":
-                                    summary_delta = rd.get("summary") or ""
-                                    if summary_delta:
-                                        for _e in emitter.thinking_delta(summary_delta):
-                                            yield _e
+                            if data.get("error"):
+                                had_error = True
+                                error = data["error"]
+                                if isinstance(error, dict):
+                                    message = error.get("message", "OpenRouter API error")
+                                    code = error.get("code")
+                                else:
+                                    message = str(error)
+                                    code = None
+                                if is_mandatory_reasoning_error(message):
+                                    register_mandatory_reasoning_model(self.target_model)
+                                print(
+                                    f"[{self.target_model}] stream error | {message}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                error_type = (
+                                    "rate_limit_error"
+                                    if code == 429
+                                    or ("rate" in message.lower() and "limit" in message.lower())
+                                    else "overloaded_error"
+                                    if code in (503, 529) and "overload" in message.lower()
+                                    else "api_error"
+                                )
+                                yield sse(
+                                    "error",
+                                    {
+                                        "type": "error",
+                                        "error": {"type": error_type, "message": message},
+                                    },
+                                )
+                                continue
 
-                        if content:
-                            for _e in emitter.close_thinking():
-                                yield _e
+                            if data.get("usage"):
+                                usage = data["usage"]
 
-                            result = self.provider_registry.process_text_content(content, "")
-                            clean_text = result.cleaned_text
+                            choice = first_choice(data)
+                            if choice is None:
+                                continue
 
-                            if clean_text:
-                                for _e in emitter.text_delta(clean_text):
+                            delta = choice.get("delta", {})
+                            if not isinstance(delta, dict):
+                                delta = {}
+
+                            if self._is_gemini and delta.get("reasoning_details"):
+                                self._append_unique_reasoning_details(
+                                    current_reasoning_details, delta["reasoning_details"]
+                                )
+
+                            reasoning = delta.get("reasoning") or ""
+                            content = delta.get("content") or ""
+
+                            if ttft is None and (reasoning or content):
+                                ttft = time.monotonic() - t0
+
+                            if reasoning:
+                                for _e in emitter.thinking_delta(reasoning):
+                                    yield _e
+                            else:
+                                # summary из reasoning_details только если плоского reasoning нет
+                                # (openai дублирует контент в оба поля — избегаем двойного эмита)
+                                for rd in (delta.get("reasoning_details") or []):
+                                    if rd.get("type") == "reasoning.summary":
+                                        summary_delta = rd.get("summary") or ""
+                                        if summary_delta:
+                                            for _e in emitter.thinking_delta(summary_delta):
+                                                yield _e
+
+                            if content:
+                                for _e in emitter.close_thinking():
                                     yield _e
 
-                            for tc in result.extracted_tool_calls:
-                                for _e in emitter.close_text():
-                                    yield _e
-                                for _e in emitter.add_tool(tc.id, tc.id, tc.name):
-                                    yield _e
-                                for _e in emitter.tool_delta(tc.id, json.dumps(tc.arguments)):
-                                    yield _e
-                                for _e in emitter.close_tool(tc.id):
-                                    yield _e
-                                if self._is_gemini and current_reasoning_details:
-                                    get_reasoning_cache().set(
-                                        tc.id, current_reasoning_details.copy()
-                                    )
+                                result = self.provider_registry.process_text_content(content, "")
+                                clean_text = result.cleaned_text
 
-                        tool_calls = delta.get("tool_calls", [])
-                        for tc in tool_calls:
-                            idx = tc.get("index", 0)
-                            if emitter.get_tool(idx) is None:
-                                tool_id = tc.get("id") or f"tool_{idx}"
-                                for _e in emitter.register_tool(idx, tool_id):
-                                    yield _e
+                                if clean_text:
+                                    for _e in emitter.text_delta(clean_text):
+                                        yield _e
 
-                            fn = tc.get("function", {})
-                            if fn.get("name"):
-                                for _e in emitter.start_tool(idx, fn["name"]):
-                                    yield _e
+                                for tc in result.extracted_tool_calls:
+                                    for _e in emitter.close_text():
+                                        yield _e
+                                    for _e in emitter.add_tool(tc.id, tc.id, tc.name):
+                                        yield _e
+                                    for _e in emitter.tool_delta(tc.id, json.dumps(tc.arguments)):
+                                        yield _e
+                                    for _e in emitter.close_tool(tc.id):
+                                        yield _e
+                                    if self._is_gemini and current_reasoning_details:
+                                        get_reasoning_cache().set(
+                                            tc.id, current_reasoning_details.copy()
+                                        )
 
-                            tool_entry = emitter.get_tool(idx)
-                            if fn.get("arguments") and tool_entry and tool_entry["started"]:
-                                for _e in emitter.tool_delta(idx, fn["arguments"]):
-                                    yield _e
+                            tool_calls = delta.get("tool_calls", [])
+                            for tc in tool_calls:
+                                idx = tc.get("index", 0)
+                                if emitter.get_tool(idx) is None:
+                                    tool_id = tc.get("id") or f"tool_{idx}"
+                                    for _e in emitter.register_tool(idx, tool_id):
+                                        yield _e
 
-                        finish = choice.get("finish_reason")
-                        if finish == "tool_calls":
-                            for key in emitter.tool_keys:
-                                for _e in emitter.close_tool(key):
-                                    yield _e
-                                t = emitter.get_tool(key)
-                                if t and self._is_gemini and current_reasoning_details:
-                                    get_reasoning_cache().set(
-                                        t["id"], current_reasoning_details.copy()
-                                    )
+                                fn = tc.get("function", {})
+                                if fn.get("name"):
+                                    for _e in emitter.start_tool(idx, fn["name"]):
+                                        yield _e
+
+                                tool_entry = emitter.get_tool(idx)
+                                if fn.get("arguments") and tool_entry and tool_entry["started"]:
+                                    for _e in emitter.tool_delta(idx, fn["arguments"]):
+                                        yield _e
+
+                            finish = choice.get("finish_reason")
+                            if finish == "tool_calls":
+                                for key in emitter.tool_keys:
+                                    for _e in emitter.close_tool(key):
+                                        yield _e
+                                    t = emitter.get_tool(key)
+                                    if t and self._is_gemini and current_reasoning_details:
+                                        get_reasoning_cache().set(
+                                            t["id"], current_reasoning_details.copy()
+                                        )
 
                 break
+            except (httpx.TransportError, httpx.TimeoutException) as e:
+                print(
+                    f"[{self.target_model}] Network error ({type(e).__name__}: {e})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if transient_retries < max_transient_retries:
+                    transient_retries += 1
+                    backoff = 2.0
+                    print(
+                        f"[{self.target_model}] Retrying in {backoff}s...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
+                for _e in emitter.error_and_finish(str(e), error_type="api_error"):
+                    yield _e
+                return
 
         # Cache reasoning details for tools closed at stream end
         if self._is_gemini and current_reasoning_details:
