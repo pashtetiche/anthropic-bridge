@@ -202,8 +202,6 @@ class OpenRouterProvider:
         )
 
         emitter = AnthropicSSEEmitter(self.target_model, estimated_input)
-        for _e in emitter.message_start():
-            yield _e
 
         usage: dict[str, Any] | None = None
         current_reasoning_details: list[dict[str, Any]] = []
@@ -214,16 +212,23 @@ class OpenRouterProvider:
         actual_model = ""
         actual_provider = ""
 
-        max_transient_retries = 2
+        max_transient_retries = 1  # 1 initial + 1 retry = max 2 attempts
         transient_retries = 0
         reasoning_retried = False
         message_started = False
         total_attempts = 0
+        max_total_attempts = 2
 
         while True:
             total_attempts += 1
+            attempt_t0 = time.monotonic()
             try:
-                timeout_config = httpx.Timeout(300.0, connect=20.0)
+                print(
+                    f"[{self.target_model}] -> OpenRouter [attempt {total_attempts}/{max_total_attempts}]...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                timeout_config = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
                 async with (
                     httpx.AsyncClient(timeout=timeout_config) as client,
                     client.stream(
@@ -237,9 +242,18 @@ class OpenRouterProvider:
                         json=payload,
                     ) as response,
                 ):
+                    elapsed = time.monotonic() - attempt_t0
                     if response.status_code != 200:
                         error_text = await response.aread()
                         decoded = error_text.decode(errors="replace")
+                        error_type, clean_msg = classify_upstream_error(
+                            response.status_code, decoded
+                        )
+                        print(
+                            f"[{self.target_model}] <- OpenRouter HTTP {response.status_code} in {elapsed:.1f}s | {clean_msg[:120]}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
                         if not reasoning_retried and is_mandatory_reasoning_error(decoded):
                             reasoning_retried = True
@@ -259,42 +273,33 @@ class OpenRouterProvider:
                             response.status_code, decoded
                         ):
                             transient_retries += 1
-                            backoff = 2.0 * transient_retries
-                            _, clean_msg = classify_upstream_error(
-                                response.status_code, decoded
-                            )
+                            backoff = 1.5
                             print(
                                 f"[{self.target_model}] [RETRY {transient_retries}/{max_transient_retries}] "
-                                f"Upstream returned HTTP {response.status_code} ({clean_msg[:120]}). "
-                                f"Retrying in {backoff:.1f}s...",
+                                f"Waiting {backoff:.1f}s before retry...",
                                 file=sys.stderr,
                                 flush=True,
                             )
                             await asyncio.sleep(backoff)
                             continue
 
-                        error_type, clean_message = classify_upstream_error(
-                            response.status_code, decoded
-                        )
                         print(
-                            f"[{self.target_model}] [RETRY EXHAUSTED] All {total_attempts} attempts failed. "
-                            f"Returning {error_type} (HTTP {response.status_code}) to client: {clean_message[:200]}",
+                            f"[{self.target_model}] [ABORT] Fast retry failed (total {time.monotonic() - t0:.1f}s). "
+                            f"Returning {error_type} (HTTP {response.status_code}) to Claude Code: {clean_msg[:150]}",
                             file=sys.stderr,
                             flush=True,
                         )
                         for _e in emitter.error_and_finish(
-                            clean_message, error_type=error_type
+                            clean_msg, error_type=error_type
                         ):
                             yield _e
                         return
 
-                    if transient_retries > 0:
-                        print(
-                            f"[{self.target_model}] [RETRY SUCCESS] Request succeeded on attempt {total_attempts} "
-                            f"(HTTP 200) -> streaming to client",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                    print(
+                        f"[{self.target_model}] <- OpenRouter HTTP 200 OK in {elapsed:.1f}s -> streaming to Claude Code",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
                     if not message_started:
                         message_started = True
@@ -457,12 +462,18 @@ class OpenRouterProvider:
                 raise
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 err_name = type(e).__name__
+                elapsed = time.monotonic() - attempt_t0
+                print(
+                    f"[{self.target_model}] <- OpenRouter {err_name} ({e}) after {elapsed:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 if transient_retries < max_transient_retries:
                     transient_retries += 1
-                    backoff = 2.0 * transient_retries
+                    backoff = 1.5
                     print(
                         f"[{self.target_model}] [RETRY {transient_retries}/{max_transient_retries}] "
-                        f"Network error ({err_name}: {e}). Retrying in {backoff:.1f}s...",
+                        f"Waiting {backoff:.1f}s before retry...",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -470,11 +481,12 @@ class OpenRouterProvider:
                     continue
 
                 print(
-                    f"[{self.target_model}] [RETRY EXHAUSTED] Network error after {total_attempts} attempts: {err_name} ({e})",
+                    f"[{self.target_model}] [ABORT] Fast retry failed after {total_attempts} attempts: {err_name} ({e}). "
+                    f"Returning rate_limit_error (HTTP 429) to Claude Code.",
                     file=sys.stderr,
                     flush=True,
                 )
-                for _e in emitter.error_and_finish(f"{err_name}: {e}", error_type="api_error"):
+                for _e in emitter.error_and_finish(f"{err_name}: {e}", error_type="rate_limit_error" if "Timeout" in err_name else "api_error"):
                     yield _e
                 return
 

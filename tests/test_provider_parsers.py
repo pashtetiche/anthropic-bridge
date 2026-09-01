@@ -506,8 +506,8 @@ async def test_openrouter_exhausts_transient_429_returns_rate_limit_error(
         )
     )
 
-    # 1 initial + 2 transient retries = 3 attempts total
-    assert attempts == 3
+    # 1 initial + 1 transient retry = 2 attempts total
+    assert attempts == 2
     error_events = [data for event, data in events if event == "error"]
     assert len(error_events) == 1
     assert error_events[0]["error"]["type"] == "rate_limit_error"
