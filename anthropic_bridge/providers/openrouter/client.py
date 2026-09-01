@@ -228,7 +228,7 @@ class OpenRouterProvider:
                     file=sys.stderr,
                     flush=True,
                 )
-                timeout_config = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
+                timeout_config = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
                 async with (
                     httpx.AsyncClient(timeout=timeout_config) as client,
                     client.stream(
