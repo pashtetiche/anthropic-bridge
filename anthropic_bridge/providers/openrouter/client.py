@@ -125,6 +125,9 @@ class OpenRouterProvider:
                 "usage": {"include": True},
             }
 
+            if payload.get("session_id"):
+                openrouter_payload["session_id"] = str(payload["session_id"])[:256]
+
             if tools:
                 openrouter_payload["tools"] = tools
                 tool_choice = convert_anthropic_tool_choice_to_openai(
@@ -223,22 +226,31 @@ class OpenRouterProvider:
             total_attempts += 1
             attempt_t0 = time.monotonic()
             try:
+                session_info = (
+                    f" [session: {payload['session_id']}]"
+                    if payload.get("session_id")
+                    else ""
+                )
                 print(
-                    f"[{self.target_model}] -> OpenRouter [attempt {total_attempts}/{max_total_attempts}]...",
+                    f"[{self.target_model}] -> OpenRouter [attempt {total_attempts}/{max_total_attempts}]{session_info}...",
                     file=sys.stderr,
                     flush=True,
                 )
                 timeout_config = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
+                req_headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                    **OPENROUTER_HEADERS,
+                }
+                if payload.get("session_id"):
+                    req_headers["x-session-id"] = str(payload["session_id"])[:256]
+
                 async with (
                     httpx.AsyncClient(timeout=timeout_config) as client,
                     client.stream(
                         "POST",
                         OPENROUTER_API_URL,
-                        headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self.api_key}",
-                            **OPENROUTER_HEADERS,
-                        },
+                        headers=req_headers,
                         json=payload,
                     ) as response,
                 ):

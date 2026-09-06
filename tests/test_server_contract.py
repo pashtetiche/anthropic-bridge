@@ -520,3 +520,104 @@ async def test_server_records_request_log_details(monkeypatch: pytest.MonkeyPatc
     assert "model: @preset/glm-5-3-flash" in details
     assert "client reasoning: disabled" in details
     assert "bridge reasoning: effort=low (forced)" in details
+
+
+@pytest.mark.asyncio
+async def test_server_extracts_claude_code_session_id_from_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_payload: dict[str, Any] = {}
+
+    class CapturingProvider(FakeProvider):
+        async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
+            captured_payload.update(payload)
+            for event, data in self.events:
+                yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    bridge = AnthropicBridge(ProxyConfig())
+    monkeypatch.setattr(
+        bridge,
+        "_get_provider",
+        lambda model: CapturingProvider([message_start_event(), ("message_stop", {"type": "message_stop"})]),
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=bridge.app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/v1/messages",
+            headers={"x-claude-code-session-id": "test-session-uuid-1234"},
+            json={"model": FAKE_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+    assert response.status_code == 200
+    assert captured_payload.get("session_id") == "test-session-uuid-1234"
+
+
+@pytest.mark.asyncio
+async def test_server_extracts_session_id_from_metadata_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_payload: dict[str, Any] = {}
+
+    class CapturingProvider(FakeProvider):
+        async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
+            captured_payload.update(payload)
+            for event, data in self.events:
+                yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    bridge = AnthropicBridge(ProxyConfig())
+    monkeypatch.setattr(
+        bridge,
+        "_get_provider",
+        lambda model: CapturingProvider([message_start_event(), ("message_stop", {"type": "message_stop"})]),
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=bridge.app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": FAKE_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "metadata": {
+                    "user_id": json.dumps({
+                        "device_id": "dev123",
+                        "session_id": "session-from-metadata-5678",
+                    })
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured_payload.get("session_id") == "session-from-metadata-5678"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_provider_includes_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from anthropic_bridge.providers import OpenRouterProvider
+
+    provider = OpenRouterProvider("openrouter/deepseek/deepseek-chat", api_key="sk-test")
+    stream_payloads: list[dict[str, Any]] = []
+
+    async def fake_stream_openrouter(payload: dict[str, Any]) -> AsyncIterator[str]:
+        stream_payloads.append(payload)
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(provider, "_stream_openrouter", fake_stream_openrouter)
+
+    events = [
+        e
+        async for e in provider.handle(
+            {
+                "session_id": "agent-session-abc",
+                "messages": [{"role": "user", "content": "Hello"}],
+            }
+        )
+    ]
+    assert len(events) == 1
+    assert len(stream_payloads) == 1
+    assert stream_payloads[0].get("session_id") == "agent-session-abc"

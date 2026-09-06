@@ -33,12 +33,17 @@ def record_request_log(
     model: str,
     client_reasoning: str,
     bridge_reasoning: str,
+    session_id: str | None = None,
 ) -> None:
-    details = (
-        f"model: {model} | "
-        f"client reasoning: {client_reasoning} | "
-        f"bridge reasoning: {bridge_reasoning}"
-    )
+    parts = [
+        f"model: {model}",
+        f"client reasoning: {client_reasoning}",
+        f"bridge reasoning: {bridge_reasoning}",
+    ]
+    if session_id:
+        sid_short = f"{session_id[:8]}..{session_id[-4:]}" if len(session_id) > 16 else session_id
+        parts.append(f"session: {sid_short}")
+    details = " | ".join(parts)
     if client_addr:
         _details_by_client[client_addr] = details
     _recent_details.append(details)

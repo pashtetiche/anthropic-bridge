@@ -1,8 +1,7 @@
+import os
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-# import json
-# import sys
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -18,6 +17,44 @@ from .providers import CopilotProvider, OpenAIProvider, OpenRouterProvider
 from .providers.openai.auth import auth_file_exists
 
 ProviderType = Literal["openrouter", "copilot", "openai"]
+
+
+def _extract_session_id(request: Request, body: dict[str, Any]) -> str | None:
+    for header in (
+        "x-claude-code-session-id",
+        "x-session-id",
+        "session-id",
+        "x-claude-session-id",
+        "claude-session-id",
+        "claude-code-session-id",
+        "anthropic-session-id",
+    ):
+        if val := request.headers.get(header):
+            return str(val).strip()[:256]
+
+    if body_sid := body.get("session_id"):
+        return str(body_sid).strip()[:256]
+
+    if metadata := body.get("metadata"):
+        if isinstance(metadata, dict):
+            for key in ("session_id", "session", "conversation_id"):
+                if val := metadata.get(key):
+                    return str(val).strip()[:256]
+
+            if user_id := metadata.get("user_id"):
+                if isinstance(user_id, str):
+                    if user_id.startswith("{") and "session_id" in user_id:
+                        try:
+                            import json
+
+                            parsed = json.loads(user_id)
+                            if isinstance(parsed, dict) and (sid := parsed.get("session_id")):
+                                return str(sid).strip()[:256]
+                        except Exception:
+                            pass
+                    return user_id.strip()[:256]
+
+    return None
 
 
 @dataclass
@@ -58,6 +95,7 @@ class AnthropicBridge:
         @self.app.post("/v1/messages/count_tokens")
         async def count_tokens(request: Request) -> JSONResponse:
             body = await request.json()
+            session_id = _extract_session_id(request, body)
             model = body.get("model", "")
             client_reasoning = extract_client_reasoning_summary(body)
             client_addr = (
@@ -70,20 +108,19 @@ class AnthropicBridge:
                 model=model,
                 client_reasoning=client_reasoning,
                 bridge_reasoning="count_tokens",
+                session_id=session_id,
             )
             return JSONResponse({"input_tokens": estimate_anthropic_input_tokens(body)})
 
         @self.app.post("/v1/messages", response_model=None)
         async def messages(request: Request) -> StreamingResponse | JSONResponse:
             body = await request.json()
-            # for _i, _m in enumerate(body.get("messages", [])):
-            #     _c = _m.get("content")
-            #     if "ponytail" in json.dumps(_c, ensure_ascii=False).lower():
-            #         _t = [b.get("type") for b in _c if isinstance(b, dict)] if isinstance(_c, list) else "str"
-            #         print(
-            #             f"[probe] IN msg#{_i} role={_m.get('role')} blocks={_t}",
-            #             file=sys.stderr, flush=True,
-            #         )
+            session_id = _extract_session_id(request, body)
+            if session_id and "session_id" not in body:
+                body["session_id"] = session_id
+            if os.environ.get("ANTHROPIC_BRIDGE_DEBUG"):
+                import sys
+                print(f"[debug] session_id={session_id}", file=sys.stderr, flush=True)
 
             model = body.get("model", "")
             client_reasoning = extract_client_reasoning_summary(body)
@@ -100,6 +137,7 @@ class AnthropicBridge:
                     model=model,
                     client_reasoning=client_reasoning,
                     bridge_reasoning="none (unauthorized)",
+                    session_id=session_id,
                 )
                 return JSONResponse(
                     status_code=401,
@@ -121,6 +159,7 @@ class AnthropicBridge:
                 model=model,
                 client_reasoning=client_reasoning,
                 bridge_reasoning=bridge_reasoning,
+                session_id=session_id,
             )
 
             if body.get("stream") is not True:
