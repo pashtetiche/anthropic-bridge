@@ -44,7 +44,10 @@ class ProviderRegistry:
         if self._is_gemini:
             if thinking:
                 budget = thinking.get("budget_tokens", 0)
-                if "gemini-3" in self.model_id.lower():
+                if (
+                    "gemini-3" in self.model_id.lower()
+                    or "gemini-4" in self.model_id.lower()
+                ):
                     request["thinking_level"] = "high" if budget >= 16000 else "low"
                 else:
                     request["thinking_budget"] = min(budget, 24000)

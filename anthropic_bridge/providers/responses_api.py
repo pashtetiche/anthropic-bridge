@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 import httpx
 
-from ..transform import normalize_system_message
+from ..transform import normalize_system_message, remove_uri_format
 from .utils import DEFAULT_USAGE, AnthropicSSEEmitter, estimate_input_tokens
 
 
@@ -135,7 +135,7 @@ def convert_tools_for_responses(
             "type": "function",
             "name": tool["name"],
             "description": tool.get("description", ""),
-            "parameters": tool.get("input_schema", {}),
+            "parameters": remove_uri_format(tool.get("input_schema", {})),
         }
         for tool in tools
     ]

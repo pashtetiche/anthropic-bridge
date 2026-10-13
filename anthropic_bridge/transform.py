@@ -27,14 +27,19 @@ def remove_uri_format(schema: Any) -> Any:
         return schema
 
     if schema.get("type") == "string" and schema.get("format") == "uri":
-        return {k: v for k, v in schema.items() if k != "format"}
+        schema = {k: v for k, v in schema.items() if k != "format"}
 
     result: dict[str, Any] = {}
     for key, value in schema.items():
         if key == "properties" and isinstance(value, dict):
             result[key] = {k: remove_uri_format(v) for k, v in value.items()}
-        elif key == "items" and isinstance(value, dict):
-            result[key] = remove_uri_format(value)
+        elif key == "items":
+            if isinstance(value, list):
+                result[key] = remove_uri_format(value[0]) if value else {}
+            elif isinstance(value, dict):
+                result[key] = remove_uri_format(value)
+            else:
+                result[key] = {}
         elif key == "additionalProperties" and isinstance(value, dict):
             result[key] = remove_uri_format(value)
         elif key in ("anyOf", "allOf", "oneOf") and isinstance(value, list):
@@ -43,6 +48,27 @@ def remove_uri_format(schema: Any) -> Any:
             result[key] = (
                 remove_uri_format(value) if isinstance(value, (dict, list)) else value
             )
+
+    # Convert list of types (e.g. ["string", "null"]) to single type + nullable
+    type_val = result.get("type")
+    if isinstance(type_val, list):
+        if "null" in type_val:
+            result["nullable"] = True
+        non_null = [t for t in type_val if t != "null"]
+        result["type"] = non_null[0] if non_null else "string"
+
+    # OpenAPI/Gemini compatibility: array must have items
+    if result.get("type") == "array" and "items" not in result:
+        result["items"] = {}
+
+    # If items is present but type is not set, set type to array
+    if "items" in result and "type" not in result:
+        result["type"] = "array"
+
+    # If properties is present but type is not set, set type to object
+    if "properties" in result and "type" not in result:
+        result["type"] = "object"
+
     return result
 
 
