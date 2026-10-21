@@ -84,13 +84,29 @@ class AnthropicBridge:
         )
 
     def _setup_routes(self) -> None:
-        @self.app.get("/")
+        @self.app.api_route("/", methods=["GET", "HEAD"])
         async def root() -> dict[str, str]:
             return {"status": "ok", "message": "Anthropic Bridge"}
 
-        @self.app.get("/health")
+        @self.app.api_route("/health", methods=["GET", "HEAD"])
         async def health() -> dict[str, str]:
             return {"status": "ok"}
+
+        @self.app.api_route("/api/hello", methods=["GET", "HEAD"])
+        async def api_hello() -> JSONResponse:
+            return JSONResponse(
+                {
+                    "status": "ok",
+                    "service": "anthropic-bridge",
+                    "message": "Hello! This is an Anthropic-to-OpenRouter/Copilot bridge.",
+                    "endpoints": {
+                        "messages": "/v1/messages",
+                        "count_tokens": "/v1/messages/count_tokens",
+                        "health": "/health",
+                    },
+                },
+                headers={"X-Service": "anthropic-bridge"},
+            )
 
         @self.app.post("/v1/messages/count_tokens")
         async def count_tokens(request: Request) -> JSONResponse:

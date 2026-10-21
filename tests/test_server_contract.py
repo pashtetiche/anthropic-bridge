@@ -621,3 +621,29 @@ async def test_openrouter_provider_includes_session_id(monkeypatch: pytest.Monke
     assert len(events) == 1
     assert len(stream_payloads) == 1
     assert stream_payloads[0].get("session_id") == "agent-session-abc"
+
+
+@pytest.mark.asyncio
+async def test_api_hello_and_health_head_support() -> None:
+    bridge = AnthropicBridge(ProxyConfig())
+
+    async with AsyncClient(
+        transport=ASGITransport(app=bridge.app),
+        base_url="http://test",
+    ) as client:
+        # HEAD and GET on /api/hello
+        head_hello = await client.head("/api/hello")
+        assert head_hello.status_code == 200
+        assert head_hello.headers.get("x-service") == "anthropic-bridge"
+
+        get_hello = await client.get("/api/hello")
+        assert get_hello.status_code == 200
+        assert get_hello.headers.get("x-service") == "anthropic-bridge"
+        data = get_hello.json()
+        assert data["status"] == "ok"
+        assert data["service"] == "anthropic-bridge"
+        assert "/v1/messages" in data["endpoints"].values()
+
+        # HEAD on / and /health
+        assert (await client.head("/")).status_code == 200
+        assert (await client.head("/health")).status_code == 200
