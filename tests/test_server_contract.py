@@ -621,6 +621,60 @@ async def test_openrouter_provider_includes_session_id(monkeypatch: pytest.Monke
     assert len(events) == 1
     assert len(stream_payloads) == 1
     assert stream_payloads[0].get("session_id") == "agent-session-abc"
+    # DeepSeek should not get auto cache_control
+    assert "cache_control" not in stream_payloads[0]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_provider_auto_adds_cache_control_for_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from anthropic_bridge.providers import OpenRouterProvider
+
+    provider = OpenRouterProvider("openrouter/anthropic/claude-haiku-5.5", api_key="sk-test")
+    stream_payloads: list[dict[str, Any]] = []
+
+    async def fake_stream_openrouter(payload: dict[str, Any]) -> AsyncIterator[str]:
+        stream_payloads.append(payload)
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(provider, "_stream_openrouter", fake_stream_openrouter)
+
+    events = [
+        e
+        async for e in provider.handle(
+            {"messages": [{"role": "user", "content": "Hello"}]}
+        )
+    ]
+    assert len(events) == 1
+    assert len(stream_payloads) == 1
+    assert stream_payloads[0].get("cache_control") == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+async def test_openrouter_provider_honors_ttl_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from anthropic_bridge.providers import OpenRouterProvider
+
+    monkeypatch.setenv("ANTHROPIC_CACHE_TTL", "1h")
+    provider = OpenRouterProvider("openrouter/anthropic/claude-sonnet-4.6", api_key="sk-test")
+    stream_payloads: list[dict[str, Any]] = []
+
+    async def fake_stream_openrouter(payload: dict[str, Any]) -> AsyncIterator[str]:
+        stream_payloads.append(payload)
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(provider, "_stream_openrouter", fake_stream_openrouter)
+
+    events = [
+        e
+        async for e in provider.handle(
+            {"messages": [{"role": "user", "content": "Hello"}]}
+        )
+    ]
+    assert len(events) == 1
+    assert stream_payloads[0].get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
 
 
 @pytest.mark.asyncio

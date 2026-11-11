@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -48,6 +49,10 @@ class OpenRouterProvider:
         self._is_gemini = (
             "gemini" in self.capability_model.lower()
             or "google/" in self.capability_model.lower()
+        )
+        self._is_anthropic = (
+            "anthropic/" in self.target_model.lower()
+            or "claude" in self.capability_model.lower()
         )
 
     def _determine_reasoning(
@@ -128,6 +133,22 @@ class OpenRouterProvider:
             if payload.get("session_id"):
                 openrouter_payload["session_id"] = str(payload["session_id"])[:256]
 
+            # Prompt caching control
+            if payload.get("cache_control") is not None:
+                if payload.get("cache_control") not in (False, "none"):
+                    openrouter_payload["cache_control"] = payload["cache_control"]
+            elif self._is_anthropic:
+                ttl_env = os.environ.get("ANTHROPIC_CACHE_TTL") or os.environ.get(
+                    "OPENROUTER_CACHE_TTL"
+                )
+                if ttl_env == "1h":
+                    openrouter_payload["cache_control"] = {
+                        "type": "ephemeral",
+                        "ttl": "1h",
+                    }
+                else:
+                    openrouter_payload["cache_control"] = {"type": "ephemeral"}
+
             if tools:
                 openrouter_payload["tools"] = tools
                 tool_choice = convert_anthropic_tool_choice_to_openai(
@@ -170,7 +191,11 @@ class OpenRouterProvider:
                 "NEVER use XML format like <xai:function_call>."
             )
             if messages and messages[0].get("role") == "system":
-                messages[0]["content"] += "\n\n" + instruction
+                sys_content = messages[0]["content"]
+                if isinstance(sys_content, list):
+                    sys_content.append({"type": "text", "text": instruction})
+                elif isinstance(sys_content, str):
+                    messages[0]["content"] = sys_content + "\n\n" + instruction
             else:
                 messages.insert(0, {"role": "system", "content": instruction})
 
@@ -532,6 +557,7 @@ class OpenRouterProvider:
 
         prompt_t = usage_summary.get("prompt_tokens", 0) or 0
         cached_t = prompt_details.get("cached_tokens", 0) or 0
+        cache_write_t = prompt_details.get("cache_write_tokens", 0) or 0
         completion_t = usage_summary.get("completion_tokens", 0) or 0
         reasoning_t = completion_details.get("reasoning_tokens", 0) or 0
         cost = usage_summary.get("cost")
@@ -557,11 +583,15 @@ class OpenRouterProvider:
             tools_str = "tools —"
 
         hit_rate = f"{cached_t / prompt_t:.0%}" if prompt_t else "—"
+        cached_str = f"cached {cached_t} ({hit_rate})"
+        if cache_write_t:
+            cached_str += f" [write {cache_write_t}]"
+
         log_parts = [
             time.strftime("%Y-%m-%d %H:%M:%S"),
             tools_str,
             f"in {prompt_t}",
-            f"cached {cached_t} ({hit_rate})",
+            cached_str,
             f"out {completion_t}",
             f"reason {reasoning_t}",
             f"effort {effort_str}",
@@ -581,7 +611,7 @@ class OpenRouterProvider:
         for _e in emitter.finish({
             # Anthropic считает input и кеш раздельно, OpenAI включает cached в prompt
             "input_tokens": max(prompt_t - cached_t, 0),
-            "cache_creation_input_tokens": 0,
+            "cache_creation_input_tokens": cache_write_t,
             "cache_read_input_tokens": cached_t,
             "output_tokens": completion_t,
         }):

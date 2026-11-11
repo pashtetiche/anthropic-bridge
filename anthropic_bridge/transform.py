@@ -125,8 +125,9 @@ def convert_anthropic_tools_to_openai(
     if not tools:
         return []
 
-    return [
-        {
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        entry: dict[str, Any] = {
             "type": "function",
             "function": {
                 "name": tool["name"],
@@ -134,8 +135,10 @@ def convert_anthropic_tools_to_openai(
                 "parameters": remove_uri_format(tool.get("input_schema", {})),
             },
         }
-        for tool in tools
-    ]
+        if "cache_control" in tool:
+            entry["cache_control"] = tool["cache_control"]
+        result.append(entry)
+    return result
 
 
 def convert_anthropic_tool_choice_to_openai(
@@ -172,9 +175,27 @@ def convert_anthropic_messages_to_openai(
 ) -> list[dict[str, Any]]:
     openai_messages: list[dict[str, Any]] = []
 
-    system_text = normalize_system_message(system)
-    if system_text:
-        openai_messages.append({"role": "system", "content": system_text})
+    if isinstance(system, list):
+        has_cache_control = any(
+            isinstance(item, dict) and "cache_control" in item for item in system
+        )
+        if has_cache_control:
+            system_blocks: list[dict[str, Any]] = []
+            for item in system:
+                block: dict[str, Any] = {
+                    "type": "text",
+                    "text": item.get("text", "") if isinstance(item, dict) else str(item),
+                }
+                if isinstance(item, dict) and "cache_control" in item:
+                    block["cache_control"] = item["cache_control"]
+                system_blocks.append(block)
+            openai_messages.append({"role": "system", "content": system_blocks})
+        else:
+            system_text = normalize_system_message(system)
+            if system_text:
+                openai_messages.append({"role": "system", "content": system_text})
+    elif isinstance(system, str) and system:
+        openai_messages.append({"role": "system", "content": system})
 
     for msg in messages:
         role = msg.get("role")
@@ -188,19 +209,24 @@ def convert_anthropic_messages_to_openai(
                 for block in content:
                     block_type = block.get("type")
                     if block_type == "text":
-                        content_parts.append(
-                            {"type": "text", "text": block.get("text", "")}
-                        )
+                        text_part: dict[str, Any] = {
+                            "type": "text",
+                            "text": block.get("text", ""),
+                        }
+                        if "cache_control" in block:
+                            text_part["cache_control"] = block["cache_control"]
+                        content_parts.append(text_part)
                     elif block_type == "image":
                         source = block.get("source", {})
-                        content_parts.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{source.get('media_type')};base64,{source.get('data')}"
-                                },
-                            }
-                        )
+                        img_part: dict[str, Any] = {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{source.get('media_type')};base64,{source.get('data')}"
+                            },
+                        }
+                        if "cache_control" in block:
+                            img_part["cache_control"] = block["cache_control"]
+                        content_parts.append(img_part)
                     elif block_type == "tool_result":
                         tool_id = block.get("tool_use_id")
                         if tool_id and tool_id not in seen_tool_ids:
@@ -213,13 +239,14 @@ def convert_anthropic_messages_to_openai(
                             result_content = block.get("content", "")
                             if not isinstance(result_content, str):
                                 result_content = json.dumps(result_content)
-                            openai_messages.append(
-                                {
-                                    "role": "tool",
-                                    "content": result_content,
-                                    "tool_call_id": tool_id,
-                                }
-                            )
+                            tool_msg: dict[str, Any] = {
+                                "role": "tool",
+                                "content": result_content,
+                                "tool_call_id": tool_id,
+                            }
+                            if "cache_control" in block:
+                                tool_msg["cache_control"] = block["cache_control"]
+                            openai_messages.append(tool_msg)
 
                 if content_parts:
                     openai_messages.append({"role": "user", "content": content_parts})
@@ -231,6 +258,9 @@ def convert_anthropic_messages_to_openai(
                 text_parts: list[str] = []
                 tool_calls: list[dict[str, Any]] = []
                 seen_ids: set[str] = set()
+                has_cache_control = any(
+                    isinstance(b, dict) and "cache_control" in b for b in content
+                )
 
                 for block in content:
                     block_type = block.get("type")
@@ -240,19 +270,32 @@ def convert_anthropic_messages_to_openai(
                         block_id = block.get("id")
                         if block_id and block_id not in seen_ids:
                             seen_ids.add(block_id)
-                            tool_calls.append(
-                                {
-                                    "id": block_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": block.get("name"),
-                                        "arguments": json.dumps(block.get("input", {})),
-                                    },
-                                }
-                            )
+                            tc_entry: dict[str, Any] = {
+                                "id": block_id,
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name"),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                },
+                            }
+                            if "cache_control" in block:
+                                tc_entry["cache_control"] = block["cache_control"]
+                            tool_calls.append(tc_entry)
 
                 assistant_msg: dict[str, Any] = {"role": "assistant"}
-                if text_parts:
+                if has_cache_control and text_parts:
+                    assistant_blocks: list[dict[str, Any]] = []
+                    for block in content:
+                        if block.get("type") == "text":
+                            t_part: dict[str, Any] = {
+                                "type": "text",
+                                "text": block.get("text", ""),
+                            }
+                            if "cache_control" in block:
+                                t_part["cache_control"] = block["cache_control"]
+                            assistant_blocks.append(t_part)
+                    assistant_msg["content"] = assistant_blocks
+                elif text_parts:
                     assistant_msg["content"] = " ".join(text_parts)
                 elif tool_calls:
                     assistant_msg["content"] = None
