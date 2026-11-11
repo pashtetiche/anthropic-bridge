@@ -1,6 +1,8 @@
 import collections
 import copy
 import logging
+import os
+import time
 from typing import Any
 
 from uvicorn.config import LOGGING_CONFIG
@@ -8,6 +10,18 @@ from uvicorn.logging import AccessFormatter
 
 _details_by_client: dict[str, str] = {}
 _recent_details: collections.deque[str] = collections.deque(maxlen=200)
+
+DEFAULT_ACCESS_FMT = '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+DEFAULT_LOG_FMT = "%(asctime)s %(levelprefix)s %(message)s"
+DEFAULT_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+def log_timestamp() -> str:
+    return time.strftime(DEFAULT_DATEFMT)
+
+
+def is_debug_enabled() -> bool:
+    return bool(os.environ.get("ANTHROPIC_BRIDGE_DEBUG"))
 
 
 def extract_client_reasoning_summary(payload: dict[str, Any]) -> str:
@@ -125,14 +139,21 @@ def setup_access_logging(
     log_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = copy.deepcopy(log_config or LOGGING_CONFIG)
-    if config and "formatters" in config and "access" in config["formatters"]:
-        config["formatters"]["access"]["()"] = BridgeAccessFormatter
+    if config and "formatters" in config:
+        if "access" in config["formatters"]:
+            config["formatters"]["access"]["()"] = BridgeAccessFormatter
+            config["formatters"]["access"]["fmt"] = DEFAULT_ACCESS_FMT
+            config["formatters"]["access"]["datefmt"] = DEFAULT_DATEFMT
+        if "default" in config["formatters"]:
+            config["formatters"]["default"]["fmt"] = DEFAULT_LOG_FMT
+            config["formatters"]["default"]["datefmt"] = DEFAULT_DATEFMT
 
     access_logger = logging.getLogger("uvicorn.access")
     for handler in access_logger.handlers:
         handler.setFormatter(
             BridgeAccessFormatter(
-                '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+                DEFAULT_ACCESS_FMT,
+                datefmt=DEFAULT_DATEFMT,
             )
         )
     return config

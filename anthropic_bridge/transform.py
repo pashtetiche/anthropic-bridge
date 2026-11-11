@@ -256,6 +256,8 @@ def convert_anthropic_messages_to_openai(
         elif role == "assistant":
             if isinstance(content, list):
                 text_parts: list[str] = []
+                thinking_parts: list[str] = []
+                reasoning_details_list: list[dict[str, Any]] = []
                 tool_calls: list[dict[str, Any]] = []
                 seen_ids: set[str] = set()
                 has_cache_control = any(
@@ -266,6 +268,34 @@ def convert_anthropic_messages_to_openai(
                     block_type = block.get("type")
                     if block_type == "text":
                         text_parts.append(block.get("text", ""))
+                    elif block_type == "thinking":
+                        t_text = block.get("thinking", "")
+                        if t_text:
+                            thinking_parts.append(t_text)
+                        sig = block.get("signature", "")
+                        if sig and sig.startswith("or_rd:"):
+                            try:
+                                import base64
+
+                                raw_json = base64.b64decode(sig[6:]).decode("utf-8")
+                                parsed_rd = json.loads(raw_json)
+                                if isinstance(parsed_rd, list):
+                                    reasoning_details_list.extend(parsed_rd)
+                            except Exception:
+                                pass
+                        elif sig:
+                            reasoning_details_list.append({
+                                "type": "reasoning.text",
+                                "text": t_text,
+                                "signature": sig,
+                            })
+                    elif block_type == "redacted_thinking":
+                        data = block.get("data", "")
+                        if data:
+                            reasoning_details_list.append({
+                                "type": "reasoning.encrypted",
+                                "data": data,
+                            })
                     elif block_type == "tool_use":
                         block_id = block.get("id")
                         if block_id and block_id not in seen_ids:
@@ -283,6 +313,19 @@ def convert_anthropic_messages_to_openai(
                             tool_calls.append(tc_entry)
 
                 assistant_msg: dict[str, Any] = {"role": "assistant"}
+
+                if thinking_parts:
+                    full_thinking = "\n".join(thinking_parts)
+                    assistant_msg["reasoning"] = full_thinking
+                    assistant_msg["reasoning_content"] = full_thinking
+
+                if reasoning_details_list:
+                    assistant_msg["reasoning_details"] = reasoning_details_list
+                elif thinking_parts:
+                    assistant_msg["reasoning_details"] = [
+                        {"type": "reasoning.text", "text": "\n".join(thinking_parts)}
+                    ]
+
                 if has_cache_control and text_parts:
                     assistant_blocks: list[dict[str, Any]] = []
                     for block in content:
@@ -297,13 +340,15 @@ def convert_anthropic_messages_to_openai(
                     assistant_msg["content"] = assistant_blocks
                 elif text_parts:
                     assistant_msg["content"] = " ".join(text_parts)
-                elif tool_calls:
+                elif tool_calls or thinking_parts:
                     assistant_msg["content"] = None
                 if tool_calls:
                     assistant_msg["tool_calls"] = tool_calls
 
-                if assistant_msg.get("content") is not None or assistant_msg.get(
-                    "tool_calls"
+                if (
+                    assistant_msg.get("content") is not None
+                    or assistant_msg.get("tool_calls")
+                    or assistant_msg.get("reasoning")
                 ):
                     openai_messages.append(assistant_msg)
             else:

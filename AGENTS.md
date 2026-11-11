@@ -44,5 +44,7 @@ ANTHROPIC_BRIDGE_LIVE_TESTS=1 OPENROUTER_API_KEY=your_key pytest tests/test_inte
 - `openrouter/registry.py` - Selects provider-specific request/response tweaks based on model ID
 - Provider implementations (Grok, Gemini, OpenAI, etc.) handle model-specific quirks like XML tool call parsing or reasoning options
 
-**Caching** (`cache.py`):
-- `ReasoningCache` persists Gemini reasoning details between tool call rounds to `~/.anthropic_bridge/cache/`
+**Caching & Reasoning Continuity**:
+- **Prompt Caching**: `transform.py` preserves `cache_control` breakpoints across `system`, `messages`, and `tools`. For Claude models on OpenRouter, 5-minute ephemeral caching (`cache_control: {"type": "ephemeral"}`) is enabled by default to trigger upstream prompt caching. Can be extended via `ANTHROPIC_CACHE_TTL=1h`.
+- **Reasoning Preservation (Preserved Thinking)**: Chain of Thought traces are preserved across agent tool steps and user turns. Outgoing reasoning is encoded into the Anthropic `thinking` block's `signature` (`or_rd:...`) and reconstructed on subsequent steps. `ReasoningCache` (`cache.py`) acts as a fallback keyed by `tool_call_id`.
+- **Debugging & Probe Logs**: Setting `ANTHROPIC_BRIDGE_DEBUG=1` enables granular `[PROBE ...]` logs showing thinking blocks and reasoning details traveling between Client, Bridge, and OpenRouter. All server and provider logs are timestamped at the beginning of each line (`YYYY-MM-DD HH:MM:SS`).

@@ -164,3 +164,78 @@ def test_convert_anthropic_messages_preserves_cache_control_on_system_and_blocks
     # Tool message preserves cache_control
     assert converted[3]["role"] == "tool"
     assert converted[3]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_convert_anthropic_messages_preserves_thinking_and_signature():
+    import base64
+    import json
+
+    from anthropic_bridge.transform import convert_anthropic_messages_to_openai
+
+    rd_data = [{"type": "reasoning.encrypted", "data": "secret_blob"}]
+    packed_sig = f"or_rd:{base64.b64encode(json.dumps(rd_data).encode()).decode()}"
+
+    messages = [
+        {"role": "user", "content": "Run tool"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "I need to call the tool to get info.",
+                    "signature": packed_sig,
+                },
+                {
+                    "type": "tool_use",
+                    "id": "call_abc",
+                    "name": "lookup",
+                    "input": {"q": "test"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "call_abc", "content": "result"}
+            ],
+        },
+    ]
+
+    converted = convert_anthropic_messages_to_openai(messages)
+    assert len(converted) == 3
+
+    asst_msg = converted[1]
+    assert asst_msg["role"] == "assistant"
+    assert asst_msg["reasoning"] == "I need to call the tool to get info."
+    assert asst_msg["reasoning_content"] == "I need to call the tool to get info."
+    assert asst_msg["reasoning_details"] == rd_data
+    assert len(asst_msg["tool_calls"]) == 1
+    assert asst_msg["tool_calls"][0]["id"] == "call_abc"
+
+
+def test_convert_anthropic_messages_plain_thinking_without_signature():
+    from anthropic_bridge.transform import convert_anthropic_messages_to_openai
+
+    messages = [
+        {"role": "user", "content": "Help me think"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "Step-by-step thinking for Kimi/DeepSeek",
+                    "signature": "",
+                },
+                {"type": "text", "text": "Here is the answer."},
+            ],
+        },
+    ]
+
+    converted = convert_anthropic_messages_to_openai(messages)
+    asst_msg = converted[1]
+    assert asst_msg["role"] == "assistant"
+    assert asst_msg["reasoning"] == "Step-by-step thinking for Kimi/DeepSeek"
+    assert asst_msg["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "Step-by-step thinking for Kimi/DeepSeek"}
+    ]
+    assert asst_msg["content"] == "Here is the answer."

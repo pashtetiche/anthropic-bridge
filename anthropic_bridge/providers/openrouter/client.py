@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from ...cache import get_reasoning_cache
-from ...logging import update_last_request_log
+from ...logging import is_debug_enabled, log_timestamp, update_last_request_log
 from ...transform import (
     convert_anthropic_messages_to_openai,
     convert_anthropic_tool_choice_to_openai,
@@ -163,6 +163,25 @@ class OpenRouterProvider:
 
             self.provider_registry.prepare_request(openrouter_payload, payload)
 
+            if is_debug_enabled():
+                outgoing_reasoning_summary = [
+                    {
+                        "idx": i,
+                        "role": m.get("role"),
+                        "has_reasoning": bool(m.get("reasoning") or m.get("reasoning_content")),
+                        "details_count": len(m.get("reasoning_details") or []),
+                        "tool_calls_count": len(m.get("tool_calls") or []),
+                    }
+                    for i, m in enumerate(openrouter_payload["messages"])
+                    if m.get("role") in ("assistant", "tool")
+                ]
+                if outgoing_reasoning_summary:
+                    print(
+                        f"{log_timestamp()} >>> [PROBE Bridge -> OpenRouter] Outgoing assistant/tool messages: {outgoing_reasoning_summary}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
             # _out = json.dumps(openrouter_payload, ensure_ascii=False).lower()
             # print(f"[probe] OUT={'ponytail' in _out}", file=sys.stderr, flush=True)
 
@@ -179,8 +198,7 @@ class OpenRouterProvider:
             payload.get("messages", []), payload.get("system")
         )
 
-        if self._is_gemini:
-            self._inject_gemini_reasoning(messages)
+        self._inject_cached_reasoning(messages)
 
         if (
             "grok" in self.capability_model.lower()
@@ -201,7 +219,7 @@ class OpenRouterProvider:
 
         return messages
 
-    def _inject_gemini_reasoning(
+    def _inject_cached_reasoning(
         self,
         openai_messages: list[dict[str, Any]],
     ) -> None:
@@ -213,12 +231,52 @@ class OpenRouterProvider:
             for tc in msg.get("tool_calls", []):
                 tool_id = tc.get("id", "")
                 cached = cache.get(tool_id)
-                if cached:
-                    if "reasoning_details" not in msg:
-                        msg["reasoning_details"] = []
-                    self._append_unique_reasoning_details(
-                        msg["reasoning_details"], cached
-                    )
+                if not cached:
+                    continue
+                if not msg.get("reasoning_details"):
+                    msg["reasoning_details"] = []
+                self._append_unique_reasoning_details(
+                    msg["reasoning_details"], cached
+                )
+                if not msg.get("reasoning"):
+                    texts = [
+                        c.get("text", "")
+                        for c in cached
+                        if isinstance(c, dict) and c.get("text")
+                    ]
+                    if texts:
+                        msg["reasoning"] = "\n".join(texts)
+                        msg["reasoning_content"] = msg["reasoning"]
+
+    # Backward compatibility alias
+    _inject_gemini_reasoning = _inject_cached_reasoning
+
+    @staticmethod
+    def _pack_reasoning_signature(details: list[dict[str, Any]]) -> str:
+        if not details:
+            return ""
+        try:
+            import base64
+
+            merged: list[dict[str, Any]] = []
+            for d in details:
+                if (
+                    merged
+                    and merged[-1].get("type") == "reasoning.text"
+                    and d.get("type") == "reasoning.text"
+                    and not d.get("signature")
+                    and not merged[-1].get("signature")
+                ):
+                    merged[-1]["text"] = merged[-1].get("text", "") + d.get("text", "")
+                else:
+                    merged.append(dict(d))
+
+            encoded = base64.b64encode(
+                json.dumps(merged, ensure_ascii=False).encode("utf-8")
+            ).decode("ascii")
+            return f"or_rd:{encoded}"
+        except Exception:
+            return ""
 
     async def _stream_openrouter(
         self, payload: dict[str, Any]
@@ -233,6 +291,7 @@ class OpenRouterProvider:
 
         usage: dict[str, Any] | None = None
         current_reasoning_details: list[dict[str, Any]] = []
+        total_reasoning_chars = 0
         had_error = False
 
         t0 = time.monotonic()
@@ -257,7 +316,7 @@ class OpenRouterProvider:
                     else ""
                 )
                 print(
-                    f"[{self.target_model}] -> OpenRouter [attempt {total_attempts}/{max_total_attempts}]{session_info}...",
+                    f"{log_timestamp()} [{self.target_model}] -> OpenRouter [attempt {total_attempts}/{max_total_attempts}]{session_info}...",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -287,7 +346,7 @@ class OpenRouterProvider:
                             response.status_code, decoded
                         )
                         print(
-                            f"[{self.target_model}] <- OpenRouter HTTP {response.status_code} in {elapsed:.1f}s | {clean_msg[:120]}",
+                            f"{log_timestamp()} [{self.target_model}] <- OpenRouter HTTP {response.status_code} in {elapsed:.1f}s | {clean_msg[:120]}",
                             file=sys.stderr,
                             flush=True,
                         )
@@ -299,7 +358,7 @@ class OpenRouterProvider:
                             self.provider_registry.prepare_request(payload, {})
                             update_last_request_log("effort=low (forced)")
                             print(
-                                f"[{self.target_model}] [REASONING FORCED] Upstream requires reasoning. "
+                                f"{log_timestamp()} [{self.target_model}] [REASONING FORCED] Upstream requires reasoning. "
                                 f"Enabling effort=low and retrying...",
                                 file=sys.stderr,
                                 flush=True,
@@ -312,7 +371,7 @@ class OpenRouterProvider:
                             transient_retries += 1
                             backoff = 1.5
                             print(
-                                f"[{self.target_model}] [RETRY {transient_retries}/{max_transient_retries}] "
+                                f"{log_timestamp()} [{self.target_model}] [RETRY {transient_retries}/{max_transient_retries}] "
                                 f"Waiting {backoff:.1f}s before retry...",
                                 file=sys.stderr,
                                 flush=True,
@@ -321,7 +380,7 @@ class OpenRouterProvider:
                             continue
 
                         print(
-                            f"[{self.target_model}] [ABORT] Fast retry failed (total {time.monotonic() - t0:.1f}s). "
+                            f"{log_timestamp()} [{self.target_model}] [ABORT] Fast retry failed (total {time.monotonic() - t0:.1f}s). "
                             f"Returning {error_type} (HTTP {response.status_code}) to Claude Code: {clean_msg[:150]}",
                             file=sys.stderr,
                             flush=True,
@@ -333,7 +392,7 @@ class OpenRouterProvider:
                         return
 
                     print(
-                        f"[{self.target_model}] <- OpenRouter HTTP 200 OK in {elapsed:.1f}s -> streaming to Claude Code",
+                        f"{log_timestamp()} [{self.target_model}] <- OpenRouter HTTP 200 OK in {elapsed:.1f}s -> streaming to Claude Code",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -387,7 +446,7 @@ class OpenRouterProvider:
                                     else "api_error"
                                 )
                                 print(
-                                    f"[{self.target_model}] [STREAM ERROR] Upstream SSE error ({error_type}): {message}",
+                                    f"{log_timestamp()} [{self.target_model}] [STREAM ERROR] Upstream SSE error ({error_type}): {message}",
                                     file=sys.stderr,
                                     flush=True,
                                 )
@@ -411,12 +470,14 @@ class OpenRouterProvider:
                             if not isinstance(delta, dict):
                                 delta = {}
 
-                            if self._is_gemini and delta.get("reasoning_details"):
+                            if delta.get("reasoning_details"):
                                 self._append_unique_reasoning_details(
                                     current_reasoning_details, delta["reasoning_details"]
                                 )
 
                             reasoning = delta.get("reasoning") or ""
+                            if reasoning:
+                                total_reasoning_chars += len(reasoning)
                             content = delta.get("content") or ""
 
                             if ttft is None and (reasoning or content):
@@ -436,7 +497,8 @@ class OpenRouterProvider:
                                                 yield _e
 
                             if content:
-                                for _e in emitter.close_thinking():
+                                sig = self._pack_reasoning_signature(current_reasoning_details)
+                                for _e in emitter.close_thinking(signature=sig):
                                     yield _e
 
                                 result = self.provider_registry.process_text_content(content, "")
@@ -455,7 +517,7 @@ class OpenRouterProvider:
                                         yield _e
                                     for _e in emitter.close_tool(tc.id):
                                         yield _e
-                                    if self._is_gemini and current_reasoning_details:
+                                    if current_reasoning_details:
                                         get_reasoning_cache().set(
                                             tc.id, current_reasoning_details.copy()
                                         )
@@ -484,7 +546,7 @@ class OpenRouterProvider:
                                     for _e in emitter.close_tool(key):
                                         yield _e
                                     t = emitter.get_tool(key)
-                                    if t and self._is_gemini and current_reasoning_details:
+                                    if t and current_reasoning_details:
                                         get_reasoning_cache().set(
                                             t["id"], current_reasoning_details.copy()
                                         )
@@ -492,7 +554,7 @@ class OpenRouterProvider:
                 break
             except asyncio.CancelledError:
                 print(
-                    f"[{self.target_model}] [CANCELLED] Client cancelled connection (attempt {total_attempts})",
+                    f"{log_timestamp()} [{self.target_model}] [CANCELLED] Client cancelled connection (attempt {total_attempts})",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -501,7 +563,7 @@ class OpenRouterProvider:
                 err_name = type(e).__name__
                 elapsed = time.monotonic() - attempt_t0
                 print(
-                    f"[{self.target_model}] <- OpenRouter {err_name} ({e}) after {elapsed:.1f}s",
+                    f"{log_timestamp()} [{self.target_model}] <- OpenRouter {err_name} ({e}) after {elapsed:.1f}s",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -509,7 +571,7 @@ class OpenRouterProvider:
                     transient_retries += 1
                     backoff = 1.5
                     print(
-                        f"[{self.target_model}] [RETRY {transient_retries}/{max_transient_retries}] "
+                        f"{log_timestamp()} [{self.target_model}] [RETRY {transient_retries}/{max_transient_retries}] "
                         f"Waiting {backoff:.1f}s before retry...",
                         file=sys.stderr,
                         flush=True,
@@ -518,7 +580,7 @@ class OpenRouterProvider:
                     continue
 
                 print(
-                    f"[{self.target_model}] [ABORT] Fast retry failed after {total_attempts} attempts: {err_name} ({e}). "
+                    f"{log_timestamp()} [{self.target_model}] [ABORT] Fast retry failed after {total_attempts} attempts: {err_name} ({e}). "
                     f"Returning rate_limit_error (HTTP 429) to Claude Code.",
                     file=sys.stderr,
                     flush=True,
@@ -528,7 +590,7 @@ class OpenRouterProvider:
                 return
 
         # Cache reasoning details for tools closed at stream end
-        if self._is_gemini and current_reasoning_details:
+        if current_reasoning_details:
             for key in emitter.tool_keys:
                 t = emitter.get_tool(key)
                 if t and not t["closed"]:
@@ -587,8 +649,14 @@ class OpenRouterProvider:
         if cache_write_t:
             cached_str += f" [write {cache_write_t}]"
 
+        if is_debug_enabled() and (total_reasoning_chars or current_reasoning_details):
+            print(
+                f"{log_timestamp()} >>> [PROBE OpenRouter -> Bridge] Model emitted reasoning: text_len={total_reasoning_chars}, details_count={len(current_reasoning_details)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         log_parts = [
-            time.strftime("%Y-%m-%d %H:%M:%S"),
             tools_str,
             f"in {prompt_t}",
             cached_str,
@@ -602,19 +670,20 @@ class OpenRouterProvider:
             log_parts.append(f"${cost:.5f}")
 
         print(
-            f"[{self.target_model}] -> {actual_model or '?'} @ "
+            f"{log_timestamp()} [{self.target_model}] -> {actual_model or '?'} @ "
             f"{actual_provider or '?'} | " + " | ".join(log_parts),
             file=sys.stderr,
             flush=True,
         )
 
+        sig = self._pack_reasoning_signature(current_reasoning_details)
         for _e in emitter.finish({
             # Anthropic считает input и кеш раздельно, OpenAI включает cached в prompt
             "input_tokens": max(prompt_t - cached_t, 0),
             "cache_creation_input_tokens": cache_write_t,
             "cache_read_input_tokens": cached_t,
             "output_tokens": completion_t,
-        }):
+        }, signature=sig):
             yield _e
 
     @staticmethod

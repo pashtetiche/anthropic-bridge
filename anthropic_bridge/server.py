@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -9,6 +8,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .cache import get_reasoning_cache
 from .logging import (
     extract_client_reasoning_summary,
+    is_debug_enabled,
+    log_timestamp,
     record_request_log,
     setup_access_logging,
 )
@@ -134,9 +135,46 @@ class AnthropicBridge:
             session_id = _extract_session_id(request, body)
             if session_id and "session_id" not in body:
                 body["session_id"] = session_id
-            if os.environ.get("ANTHROPIC_BRIDGE_DEBUG"):
+
+            if is_debug_enabled():
                 import sys
-                print(f"[debug] session_id={session_id}", file=sys.stderr, flush=True)
+
+                thinking_blocks = []
+                for m_idx, msg in enumerate(body.get("messages", [])):
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for _b_idx, block in enumerate(content):
+                            if isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"):
+                                sig = block.get("signature", "")
+                                thinking_blocks.append({
+                                    "msg_idx": m_idx,
+                                    "role": msg.get("role"),
+                                    "type": block.get("type"),
+                                    "text_len": len(block.get("thinking", "")),
+                                    "preview": block.get("thinking", "")[:60],
+                                    "signature": (sig[:25] + "...") if len(sig) > 25 else sig,
+                                    "sig_len": len(sig),
+                                })
+                if thinking_blocks:
+                    print(
+                        f"{log_timestamp()} >>> [PROBE Client -> Bridge] Incoming request has {len(thinking_blocks)} thinking block(s): {thinking_blocks}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    has_tool_history = any(
+                        isinstance(m.get("content"), list)
+                        and any(isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result") for b in m["content"])
+                        for m in body.get("messages", [])
+                    )
+                    if has_tool_history:
+                        print(
+                            f"{log_timestamp()} >>> [PROBE Client -> Bridge] Incoming request has tool_use/tool_result, but NO thinking blocks in history!",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                if session_id:
+                    print(f"{log_timestamp()} [debug] session_id={session_id}", file=sys.stderr, flush=True)
 
             model = body.get("model", "")
             client_reasoning = extract_client_reasoning_summary(body)

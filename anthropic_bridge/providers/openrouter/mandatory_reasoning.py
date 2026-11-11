@@ -3,6 +3,8 @@ import os
 import sys
 from typing import Any
 
+from ...logging import log_timestamp
+
 ENV_VARS = [
     "OPENROUTER_MANDATORY_REASONING_MODELS",
     "MANDATORY_REASONING_MODELS",
@@ -64,7 +66,7 @@ def register_mandatory_reasoning_model(model: str) -> None:
     updated_str = ",".join(sorted(current_env_models))
     os.environ[PRIMARY_ENV_VAR] = updated_str
     print(
-        f"[mandatory-reasoning] Added '{model}' to {PRIMARY_ENV_VAR}: {updated_str}",
+        f"{log_timestamp()} [mandatory-reasoning] Added '{model}' to {PRIMARY_ENV_VAR}: {updated_str}",
         file=sys.stderr,
         flush=True,
     )
