@@ -68,6 +68,16 @@ def test_register_mandatory_reasoning_model(monkeypatch: pytest.MonkeyPatch) -> 
     assert "glm-5-3-flash" in env_val
 
 
+def test_default_mandatory_reasoning_muse_models() -> None:
+    assert is_mandatory_reasoning_model("meta/muse-ember")
+    assert is_mandatory_reasoning_model("@preset/muse-ember")
+    assert is_mandatory_reasoning_model("openrouter/@preset/muse-ember")
+    assert is_mandatory_reasoning_model("openrouter/meta/muse-ember")
+    assert is_mandatory_reasoning_model("muse-ember")
+    assert is_mandatory_reasoning_model("muse-wonder")
+    assert is_mandatory_reasoning_model("meta/muse-spark")
+
+
 def test_is_mandatory_reasoning_error() -> None:
     raw_error = (
         '{"error":{"message":"Reasoning is mandatory for this endpoint '

@@ -182,6 +182,21 @@ class OpenRouterProvider:
                         flush=True,
                     )
 
+                out_cc_top = openrouter_payload.get("cache_control")
+                out_msg_cc = []
+                for i, m in enumerate(openrouter_payload.get("messages", [])):
+                    if "cache_control" in m:
+                        out_msg_cc.append((i, m.get("role"), "msg_level"))
+                    elif isinstance(m.get("content"), list):
+                        if any(isinstance(b, dict) and "cache_control" in b for b in m["content"]):
+                            out_msg_cc.append((i, m.get("role"), "block_level"))
+                print(
+                    f"{log_timestamp()} >>> [PROBE Bridge -> OpenRouter] CacheControl outgoing: top_level={out_cc_top}, "
+                    f"msg_breakpoints={out_msg_cc} (last_breakpoint={out_msg_cc[-1] if out_msg_cc else None})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
             # _out = json.dumps(openrouter_payload, ensure_ascii=False).lower()
             # print(f"[probe] OUT={'ponytail' in _out}", file=sys.stderr, flush=True)
 
@@ -301,10 +316,12 @@ class OpenRouterProvider:
 
         max_transient_retries = 1  # 1 initial + 1 retry = max 2 attempts
         transient_retries = 0
+        max_empty_stream_retries = 1
+        empty_stream_retries = 0
         reasoning_retried = False
         message_started = False
         total_attempts = 0
-        max_total_attempts = 2
+        max_total_attempts = 3
 
         while True:
             total_attempts += 1
@@ -550,6 +567,26 @@ class OpenRouterProvider:
                                         get_reasoning_cache().set(
                                             t["id"], current_reasoning_details.copy()
                                         )
+
+                    if (
+                        not emitter.had_content
+                        and not emitter.has_tools
+                        and not had_error
+                        and empty_stream_retries < max_empty_stream_retries
+                    ):
+                        empty_stream_retries += 1
+                        backoff = 1.0
+                        print(
+                            f"{log_timestamp()} [{self.target_model}] [EMPTY STREAM] Upstream returned 0 content tokens. "
+                            f"Retrying ({empty_stream_retries}/{max_empty_stream_retries}) after {backoff:.1f}s...",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        current_reasoning_details.clear()
+                        total_reasoning_chars = 0
+                        usage = None
+                        await asyncio.sleep(backoff)
+                        continue
 
                 break
             except asyncio.CancelledError:

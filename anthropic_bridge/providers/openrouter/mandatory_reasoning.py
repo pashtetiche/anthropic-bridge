@@ -12,6 +12,11 @@ ENV_VARS = [
 ]
 PRIMARY_ENV_VAR = "OPENROUTER_MANDATORY_REASONING_MODELS"
 
+DEFAULT_MANDATORY_REASONING_PATTERNS: tuple[str, ...] = (
+    "muse-",
+    "meta/muse-",
+)
+
 _in_memory_models: set[str] = set()
 
 
@@ -77,6 +82,12 @@ def is_mandatory_reasoning_model(model: str) -> bool:
         return False
     norm = _normalize_model_name(model)
     without_preset = norm.removeprefix("@preset/")
+
+    if any(norm.startswith(p) or without_preset.startswith(p) for p in DEFAULT_MANDATORY_REASONING_PATTERNS):
+        return True
+    slug = norm.split("/")[-1]
+    if any(slug.startswith(p) for p in DEFAULT_MANDATORY_REASONING_PATTERNS):
+        return True
 
     mandatory_set = get_mandatory_reasoning_models()
     if norm in mandatory_set or without_preset in mandatory_set:

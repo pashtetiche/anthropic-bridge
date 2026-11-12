@@ -512,3 +512,93 @@ async def test_openrouter_exhausts_transient_429_returns_rate_limit_error(
     assert len(error_events) == 1
     assert error_events[0]["error"]["type"] == "rate_limit_error"
     assert error_events[0]["error"]["message"] == "Rate limit exceeded"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_recovers_from_empty_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class FakeResponse:
+        def __init__(self, status_code: int, chunks: list[str]):
+            self.status_code = status_code
+            self._chunks = chunks
+
+        async def aread(self) -> bytes:
+            return b""
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            for chunk in self._chunks:
+                yield chunk
+
+        async def __aenter__(self) -> "FakeResponse":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                # 1st attempt: 200 OK but 0 content tokens (empty stream)
+                return FakeResponse(
+                    200,
+                    [
+                        ": OPENROUTER PROCESSING\n\n",
+                        'data: {"choices":[]}\n\n',
+                        'data: {"usage":{"prompt_tokens":0,"completion_tokens":0}}\n\n',
+                        "data: [DONE]\n\n",
+                    ],
+                )
+            # 2nd attempt: successful content
+            return FakeResponse(
+                200,
+                [
+                    'data: {"choices":[{"index":0,"delta":{"content":"Recovered from empty stream","role":"assistant"},"finish_reason":"stop"}]}\n\n',
+                    "data: [DONE]\n\n",
+                ],
+            )
+
+    async def noop_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.httpx.AsyncClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.asyncio.sleep",
+        noop_sleep,
+    )
+
+    provider = OpenRouterProvider("openrouter/meta/muse-ember", "token")
+    events = await collect_events(
+        provider.handle(
+            {
+                "model": "openrouter/meta/muse-ember",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
+    )
+
+    assert attempts == 2
+    assert not any(event == "error" for event, _ in events)
+    text_deltas = [
+        data["delta"]["text"]
+        for event, data in events
+        if event == "content_block_delta"
+        and data["delta"].get("type") == "text_delta"
+    ]
+    assert "Recovered from empty stream" in "".join(text_deltas)

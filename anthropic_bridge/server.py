@@ -173,6 +173,35 @@ class AnthropicBridge:
                             file=sys.stderr,
                             flush=True,
                         )
+
+                # Анализ входящих меток cache_control
+                system_val = body.get("system")
+                sys_cc = False
+                if isinstance(system_val, list):
+                    sys_cc = any(isinstance(b, dict) and "cache_control" in b for b in system_val)
+                elif isinstance(system_val, dict) and "cache_control" in system_val:
+                    sys_cc = True
+
+                tools_val = body.get("tools") or []
+                tools_cc = any(isinstance(t, dict) and "cache_control" in t for t in tools_val)
+
+                msg_cc_indices = []
+                for m_idx, msg in enumerate(body.get("messages", [])):
+                    c = msg.get("content")
+                    if isinstance(c, list):
+                        if any(isinstance(b, dict) and "cache_control" in b for b in c):
+                            msg_cc_indices.append((m_idx, msg.get("role")))
+                    elif isinstance(msg, dict) and "cache_control" in msg:
+                        msg_cc_indices.append((m_idx, msg.get("role")))
+
+                print(
+                    f"{log_timestamp()} >>> [PROBE Client -> Bridge] CacheControl incoming: "
+                    f"system_cc={sys_cc}, tools_cc={tools_cc} (of {len(tools_val)}), "
+                    f"msg_breakpoints={msg_cc_indices} (total msgs: {len(body.get('messages', []))})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
                 if session_id:
                     print(f"{log_timestamp()} [debug] session_id={session_id}", file=sys.stderr, flush=True)
 
