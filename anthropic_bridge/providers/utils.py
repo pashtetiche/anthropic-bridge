@@ -214,6 +214,30 @@ class AnthropicSSEEmitter:
             }),
         ]
 
+    def emit_redacted_thinking(self, data: str) -> list[str]:
+        """Emit a standalone thinking block carrying only an opaque signature."""
+        if not data:
+            return []
+        self.had_content = True
+        idx = self._cur_idx
+        self._cur_idx += 1
+        return [
+            sse("content_block_start", {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            }),
+            sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "signature_delta", "signature": data},
+            }),
+            sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": idx,
+            }),
+        ]
+
     def text_delta(self, text: str) -> list[str]:
         self.had_content = True
         events: list[str] = []

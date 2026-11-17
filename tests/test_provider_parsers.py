@@ -263,6 +263,81 @@ def test_openrouter_inject_gemini_reasoning_deduplicates_cached_entries(
     assert messages[0]["reasoning_details"] == [{"id": "r1", "type": "reasoning"}]
 
 
+def test_openrouter_inject_cached_reasoning_normalizes_chunked_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCache:
+        def get(self, tool_call_id: str) -> list[dict[str, Any]] | None:
+            if tool_call_id == "tool_1":
+                return [
+                    {"type": "reasoning.text", "text": "Part 1 "},
+                    {"type": "reasoning.text", "text": "Part 2"},
+                ]
+            return None
+
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.get_reasoning_cache",
+        lambda: FakeCache(),
+    )
+
+    provider = OpenRouterProvider("openrouter/deepseek/deepseek-v4", "token")
+    messages = [
+        {
+            "role": "assistant",
+            "reasoning": "Part 1 Part 2",
+            "reasoning_details": [{"type": "reasoning.text", "text": "Part 1 Part 2"}],
+            "tool_calls": [{"id": "tool_1", "function": {"name": "a", "arguments": "{}"}}],
+        }
+    ]
+
+    provider._inject_cached_reasoning(messages)
+
+    assert messages[0]["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "Part 1 Part 2"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_emits_redacted_thinking_for_trailing_encrypted_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = [
+        'data: {"model":"google/gemini-4","choices":[{"delta":{"content":"Done"}}]}\n',
+        'data: {"model":"google/gemini-4","choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"ENC_END","format":"google-gemini-v1","index":0}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n',
+        "data: [DONE]\n",
+    ]
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.httpx.AsyncClient",
+        fake_client_factory(chunks),
+    )
+
+    provider = OpenRouterProvider("openrouter/google/gemini-4", "token")
+    events = await collect_events(
+        provider.handle(
+            {
+                "model": "openrouter/google/gemini-4",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
+    )
+
+    thinking_blocks = [
+        data["content_block"]
+        for event, data in events
+        if event == "content_block_start"
+        and data["content_block"].get("type") == "thinking"
+    ]
+    sig_deltas = [
+        data["delta"]["signature"]
+        for event, data in events
+        if event == "content_block_delta"
+        and data["delta"].get("type") == "signature_delta"
+    ]
+    assert len(thinking_blocks) == 1
+    assert len(sig_deltas) == 1
+    assert sig_deltas[0].startswith("or_rd:")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("anthropic_payload", "expected_reasoning"),

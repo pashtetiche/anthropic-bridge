@@ -168,9 +168,14 @@ class OpenRouterProvider:
                     {
                         "idx": i,
                         "role": m.get("role"),
-                        "has_reasoning": bool(m.get("reasoning") or m.get("reasoning_content")),
-                        "details_count": len(m.get("reasoning_details") or []),
+                        "reasoning_len": len(m.get("reasoning") or m.get("reasoning_content") or ""),
+                        "details_types": [
+                            d.get("type") for d in (m.get("reasoning_details") or []) if isinstance(d, dict)
+                        ],
                         "tool_calls_count": len(m.get("tool_calls") or []),
+                        "msg_hash": hashlib.sha256(
+                            json.dumps(m, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                        ).hexdigest()[:8],
                     }
                     for i, m in enumerate(openrouter_payload["messages"])
                     if m.get("role") in ("assistant", "tool")
@@ -239,7 +244,8 @@ class OpenRouterProvider:
         openai_messages: list[dict[str, Any]],
     ) -> None:
         cache = get_reasoning_cache()
-        for msg in openai_messages:
+        injected_hits: list[dict[str, Any]] = []
+        for idx, msg in enumerate(openai_messages):
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
                 continue
 
@@ -248,44 +254,69 @@ class OpenRouterProvider:
                 cached = cache.get(tool_id)
                 if not cached:
                     continue
+                normalized_cached = self._merge_reasoning_details(cached)
+                before_count = len(msg.get("reasoning_details") or [])
                 if not msg.get("reasoning_details"):
                     msg["reasoning_details"] = []
                 self._append_unique_reasoning_details(
-                    msg["reasoning_details"], cached
+                    msg["reasoning_details"], normalized_cached
                 )
                 if not msg.get("reasoning"):
                     texts = [
                         c.get("text", "")
-                        for c in cached
+                        for c in normalized_cached
                         if isinstance(c, dict) and c.get("text")
                     ]
                     if texts:
                         msg["reasoning"] = "\n".join(texts)
                         msg["reasoning_content"] = msg["reasoning"]
+                after_count = len(msg["reasoning_details"])
+                if after_count > before_count:
+                    injected_hits.append({
+                        "msg_idx": idx,
+                        "tool_id": tool_id,
+                        "before_details": before_count,
+                        "after_details": after_count,
+                        "types": [c.get("type") for c in normalized_cached if isinstance(c, dict)],
+                    })
+        if is_debug_enabled() and injected_hits:
+            print(
+                f"{log_timestamp()} >>> [PROBE ReasoningCache -> OpenRouter] Injected cached reasoning: {injected_hits}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # Backward compatibility alias
     _inject_gemini_reasoning = _inject_cached_reasoning
 
     @staticmethod
-    def _pack_reasoning_signature(details: list[dict[str, Any]]) -> str:
+    def _merge_reasoning_details(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not details:
+            return []
+        merged: list[dict[str, Any]] = []
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            if (
+                merged
+                and merged[-1].get("type") == "reasoning.text"
+                and d.get("type") == "reasoning.text"
+                and not d.get("signature")
+                and not merged[-1].get("signature")
+            ):
+                merged[-1]["text"] = merged[-1].get("text", "") + d.get("text", "")
+            else:
+                merged.append(dict(d))
+        return merged
+
+    @classmethod
+    def _pack_reasoning_signature(cls, details: list[dict[str, Any]]) -> str:
         if not details:
             return ""
         try:
             import base64
 
-            merged: list[dict[str, Any]] = []
-            for d in details:
-                if (
-                    merged
-                    and merged[-1].get("type") == "reasoning.text"
-                    and d.get("type") == "reasoning.text"
-                    and not d.get("signature")
-                    and not merged[-1].get("signature")
-                ):
-                    merged[-1]["text"] = merged[-1].get("text", "") + d.get("text", "")
-                else:
-                    merged.append(dict(d))
-
+            merged = cls._merge_reasoning_details(details)
             encoded = base64.b64encode(
                 json.dumps(merged, ensure_ascii=False).encode("utf-8")
             ).decode("ascii")
@@ -306,7 +337,10 @@ class OpenRouterProvider:
 
         usage: dict[str, Any] | None = None
         current_reasoning_details: list[dict[str, Any]] = []
+        packed_sig_details_count = 0
         total_reasoning_chars = 0
+        sample_reasoning_chunks: list[str] = []
+        cached_tool_ids: list[str] = []
         had_error = False
 
         t0 = time.monotonic()
@@ -495,6 +529,8 @@ class OpenRouterProvider:
                             reasoning = delta.get("reasoning") or ""
                             if reasoning:
                                 total_reasoning_chars += len(reasoning)
+                                if len(sample_reasoning_chunks) < 8:
+                                    sample_reasoning_chunks.append(reasoning)
                             content = delta.get("content") or ""
 
                             if ttft is None and (reasoning or content):
@@ -514,9 +550,11 @@ class OpenRouterProvider:
                                                 yield _e
 
                             if content:
-                                sig = self._pack_reasoning_signature(current_reasoning_details)
-                                for _e in emitter.close_thinking(signature=sig):
-                                    yield _e
+                                if emitter.thinking_started:
+                                    sig = self._pack_reasoning_signature(current_reasoning_details)
+                                    packed_sig_details_count = len(current_reasoning_details)
+                                    for _e in emitter.close_thinking(signature=sig):
+                                        yield _e
 
                                 result = self.provider_registry.process_text_content(content, "")
                                 clean_text = result.cleaned_text
@@ -536,8 +574,9 @@ class OpenRouterProvider:
                                         yield _e
                                     if current_reasoning_details:
                                         get_reasoning_cache().set(
-                                            tc.id, current_reasoning_details.copy()
+                                            tc.id, self._merge_reasoning_details(current_reasoning_details)
                                         )
+                                        cached_tool_ids.append(tc.id)
 
                             tool_calls = delta.get("tool_calls", [])
                             for tc in tool_calls:
@@ -560,13 +599,15 @@ class OpenRouterProvider:
                             finish = choice.get("finish_reason")
                             if finish == "tool_calls":
                                 for key in emitter.tool_keys:
+                                    t = emitter.get_tool(key)
+                                    was_open = t is not None and not t["closed"]
                                     for _e in emitter.close_tool(key):
                                         yield _e
-                                    t = emitter.get_tool(key)
-                                    if t and current_reasoning_details:
+                                    if was_open and t and current_reasoning_details:
                                         get_reasoning_cache().set(
-                                            t["id"], current_reasoning_details.copy()
+                                            t["id"], self._merge_reasoning_details(current_reasoning_details)
                                         )
+                                        cached_tool_ids.append(t["id"])
 
                     if (
                         not emitter.had_content
@@ -583,7 +624,10 @@ class OpenRouterProvider:
                             flush=True,
                         )
                         current_reasoning_details.clear()
+                        packed_sig_details_count = 0
                         total_reasoning_chars = 0
+                        sample_reasoning_chunks.clear()
+                        cached_tool_ids.clear()
                         usage = None
                         await asyncio.sleep(backoff)
                         continue
@@ -628,10 +672,24 @@ class OpenRouterProvider:
 
         # Cache reasoning details for tools closed at stream end
         if current_reasoning_details:
+            merged_for_cache = self._merge_reasoning_details(current_reasoning_details)
             for key in emitter.tool_keys:
                 t = emitter.get_tool(key)
                 if t and not t["closed"]:
-                    get_reasoning_cache().set(t["id"], current_reasoning_details.copy())
+                    get_reasoning_cache().set(t["id"], merged_for_cache)
+                    cached_tool_ids.append(t["id"])
+
+        # Emit trailing encrypted reasoning if thinking was already closed or never started
+        if not emitter.thinking_started and current_reasoning_details:
+            trailing_encrypted = [
+                d
+                for d in current_reasoning_details[packed_sig_details_count:]
+                if isinstance(d, dict) and d.get("type") == "reasoning.encrypted"
+            ]
+            if trailing_encrypted:
+                redacted_data = self._pack_reasoning_signature(trailing_encrypted)
+                for _e in emitter.emit_redacted_thinking(redacted_data):
+                    yield _e
 
         if not emitter.had_content and not emitter.has_tools and not had_error:
             yield sse(
@@ -686,9 +744,20 @@ class OpenRouterProvider:
         if cache_write_t:
             cached_str += f" [write {cache_write_t}]"
 
-        if is_debug_enabled() and (total_reasoning_chars or current_reasoning_details):
+        sig = self._pack_reasoning_signature(current_reasoning_details)
+
+        if is_debug_enabled() and (total_reasoning_chars or current_reasoning_details or emitter.has_tools):
+            details_types = [
+                d.get("type") for d in current_reasoning_details if isinstance(d, dict)
+            ]
+            emitted_tools = [
+                (emitter.get_tool(k) or {}).get("name") for k in emitter.tool_keys
+            ]
             print(
-                f"{log_timestamp()} >>> [PROBE OpenRouter -> Bridge] Model emitted reasoning: text_len={total_reasoning_chars}, details_count={len(current_reasoning_details)}",
+                f"{log_timestamp()} >>> [PROBE OpenRouter -> Bridge] "
+                f"reasoning_chars={total_reasoning_chars}, details_types={details_types}, "
+                f"sig_len={len(sig)}, tools={emitted_tools}, cached_tool_ids={cached_tool_ids}, "
+                f"first_chunks={sample_reasoning_chunks!r}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -713,7 +782,6 @@ class OpenRouterProvider:
             flush=True,
         )
 
-        sig = self._pack_reasoning_signature(current_reasoning_details)
         for _e in emitter.finish({
             # Anthropic считает input и кеш раздельно, OpenAI включает cached в prompt
             "input_tokens": max(prompt_t - cached_t, 0),

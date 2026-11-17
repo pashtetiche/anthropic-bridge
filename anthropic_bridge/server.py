@@ -174,6 +174,36 @@ class AnthropicBridge:
                             flush=True,
                         )
 
+                assistant_shape = []
+                for m_idx, msg in enumerate(body.get("messages", [])):
+                    if msg.get("role") != "assistant":
+                        continue
+                    c = msg.get("content")
+                    if isinstance(c, list):
+                        types = [b.get("type") for b in c if isinstance(b, dict)]
+                        has_or_rd = any(
+                            isinstance(b, dict)
+                            and b.get("type") == "thinking"
+                            and str(b.get("signature", "")).startswith("or_rd:")
+                            for b in c
+                        )
+                        assistant_shape.append({
+                            "idx": m_idx,
+                            "thinking": types.count("thinking"),
+                            "redacted": types.count("redacted_thinking"),
+                            "or_rd": has_or_rd,
+                            "text": types.count("text"),
+                            "tool_use": types.count("tool_use"),
+                        })
+                    else:
+                        assistant_shape.append({"idx": m_idx, "str_len": len(c) if isinstance(c, str) else 0})
+                if assistant_shape:
+                    print(
+                        f"{log_timestamp()} >>> [PROBE Client -> Bridge] Assistant history shape: {assistant_shape}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
                 # Анализ входящих меток cache_control
                 system_val = body.get("system")
                 sys_cc = False

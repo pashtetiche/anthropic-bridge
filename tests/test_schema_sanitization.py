@@ -239,3 +239,34 @@ def test_convert_anthropic_messages_plain_thinking_without_signature():
         {"type": "reasoning.text", "text": "Step-by-step thinking for Kimi/DeepSeek"}
     ]
     assert asst_msg["content"] == "Here is the answer."
+
+
+def test_convert_anthropic_messages_redacted_thinking_or_rd():
+    import base64
+    import json
+
+    from anthropic_bridge.transform import convert_anthropic_messages_to_openai
+
+    encrypted = [
+        {
+            "type": "reasoning.encrypted",
+            "data": "ENC_BLOB",
+            "format": "google-gemini-v1",
+            "index": 0,
+        }
+    ]
+    packed = f"or_rd:{base64.b64encode(json.dumps(encrypted).encode()).decode()}"
+
+    messages = [
+        {"role": "user", "content": "Hi"},
+        {
+            "role": "assistant",
+            "content": [{"type": "redacted_thinking", "data": packed}],
+        },
+    ]
+
+    converted = convert_anthropic_messages_to_openai(messages)
+    assert len(converted) == 2
+    assert converted[1]["role"] == "assistant"
+    assert converted[1]["content"] is None
+    assert converted[1]["reasoning_details"] == encrypted

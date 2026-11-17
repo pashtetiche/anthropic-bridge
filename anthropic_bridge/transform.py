@@ -291,7 +291,20 @@ def convert_anthropic_messages_to_openai(
                             })
                     elif block_type == "redacted_thinking":
                         data = block.get("data", "")
-                        if data:
+                        if data and data.startswith("or_rd:"):
+                            try:
+                                import base64
+
+                                raw_json = base64.b64decode(data[6:]).decode("utf-8")
+                                parsed_rd = json.loads(raw_json)
+                                if isinstance(parsed_rd, list):
+                                    reasoning_details_list.extend(parsed_rd)
+                            except Exception:
+                                reasoning_details_list.append({
+                                    "type": "reasoning.encrypted",
+                                    "data": data,
+                                })
+                        elif data:
                             reasoning_details_list.append({
                                 "type": "reasoning.encrypted",
                                 "data": data,
@@ -340,7 +353,7 @@ def convert_anthropic_messages_to_openai(
                     assistant_msg["content"] = assistant_blocks
                 elif text_parts:
                     assistant_msg["content"] = " ".join(text_parts)
-                elif tool_calls or thinking_parts:
+                elif tool_calls or thinking_parts or reasoning_details_list:
                     assistant_msg["content"] = None
                 if tool_calls:
                     assistant_msg["tool_calls"] = tool_calls
@@ -349,6 +362,7 @@ def convert_anthropic_messages_to_openai(
                     assistant_msg.get("content") is not None
                     or assistant_msg.get("tool_calls")
                     or assistant_msg.get("reasoning")
+                    or assistant_msg.get("reasoning_details")
                 ):
                     openai_messages.append(assistant_msg)
             else:
