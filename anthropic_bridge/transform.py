@@ -159,14 +159,33 @@ def convert_anthropic_tool_choice_to_openai(
     return "auto"
 
 
+def _is_billing_header_text(text: str) -> bool:
+    return text.lstrip().lower().startswith("x-anthropic-billing-header:")
+
+
+def _strip_billing_header_from_str(text: str) -> str:
+    if not _is_billing_header_text(text):
+        return text
+    lines = text.splitlines()
+    while lines and _is_billing_header_text(lines[0]):
+        lines.pop(0)
+    return "\n".join(lines).lstrip("\n")
+
+
 def normalize_system_message(
     system: str | list[dict[str, Any]] | None,
 ) -> str | None:
     if isinstance(system, list):
-        return "\n\n".join(
-            item.get("text", "") if isinstance(item, dict) else str(item)
-            for item in system
-        )
+        parts: list[str] = []
+        for item in system:
+            text = item.get("text", "") if isinstance(item, dict) else str(item)
+            cleaned = _strip_billing_header_from_str(text)
+            if cleaned:
+                parts.append(cleaned)
+        return "\n\n".join(parts) if parts else None
+    if isinstance(system, str):
+        cleaned = _strip_billing_header_from_str(system)
+        return cleaned or None
     return system
 
 
@@ -176,12 +195,20 @@ def convert_anthropic_messages_to_openai(
     openai_messages: list[dict[str, Any]] = []
 
     if isinstance(system, list):
+        filtered_system = [
+            item
+            for item in system
+            if not _is_billing_header_text(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+            )
+        ]
         has_cache_control = any(
-            isinstance(item, dict) and "cache_control" in item for item in system
+            isinstance(item, dict) and "cache_control" in item
+            for item in filtered_system
         )
-        if has_cache_control:
+        if filtered_system and has_cache_control:
             system_blocks: list[dict[str, Any]] = []
-            for item in system:
+            for item in filtered_system:
                 block: dict[str, Any] = {
                     "type": "text",
                     "text": item.get("text", "") if isinstance(item, dict) else str(item),
@@ -190,12 +217,14 @@ def convert_anthropic_messages_to_openai(
                     block["cache_control"] = item["cache_control"]
                 system_blocks.append(block)
             openai_messages.append({"role": "system", "content": system_blocks})
-        else:
-            system_text = normalize_system_message(system)
+        elif filtered_system:
+            system_text = normalize_system_message(filtered_system)
             if system_text:
                 openai_messages.append({"role": "system", "content": system_text})
     elif isinstance(system, str) and system:
-        openai_messages.append({"role": "system", "content": system})
+        cleaned_system = _strip_billing_header_from_str(system)
+        if cleaned_system:
+            openai_messages.append({"role": "system", "content": cleaned_system})
 
     for msg in messages:
         role = msg.get("role")
@@ -369,8 +398,29 @@ def convert_anthropic_messages_to_openai(
                 openai_messages.append({"role": "assistant", "content": content})
 
         elif role == "system":
-            openai_messages.append(
-                {"role": "system", "content": extract_text_content(content)}
-            )
+            sys_msg: dict[str, Any] = {"role": "system"}
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and "cache_control" in b for b in content
+            ):
+                sys_blocks: list[dict[str, Any]] = []
+                for item in content:
+                    if isinstance(item, dict):
+                        s_block: dict[str, Any] = {
+                            "type": "text",
+                            "text": item.get("text", "")
+                            if item.get("type") == "text"
+                            else extract_text_content(item),
+                        }
+                        if "cache_control" in item:
+                            s_block["cache_control"] = item["cache_control"]
+                        sys_blocks.append(s_block)
+                    else:
+                        sys_blocks.append({"type": "text", "text": str(item)})
+                sys_msg["content"] = sys_blocks
+            else:
+                sys_msg["content"] = extract_text_content(content)
+            if "cache_control" in msg:
+                sys_msg["cache_control"] = msg["cache_control"]
+            openai_messages.append(sys_msg)
 
     return openai_messages

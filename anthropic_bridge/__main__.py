@@ -3,7 +3,7 @@ import os
 
 import uvicorn
 
-from .logging import setup_access_logging
+from .logging import setup_access_logging, setup_debug_log_file
 from .server import create_app
 
 
@@ -16,6 +16,7 @@ def main() -> None:
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     copilot_token = os.environ.get("GITHUB_COPILOT_TOKEN", "")
 
+    debug_log_path = setup_debug_log_file()
     log_config = setup_access_logging()
 
     app = create_app(
@@ -24,6 +25,8 @@ def main() -> None:
     )
 
     print(f"Starting Anthropic Bridge on {args.host}:{args.port}")
+    if debug_log_path:
+        print(f"  Debug log: {debug_log_path} (latest: {debug_log_path.parent / 'anthropic-bridge-debug-latest.log'})")
     print("  OpenAI: openai/* models")
     if copilot_token:
         print("  Copilot: copilot/* models")

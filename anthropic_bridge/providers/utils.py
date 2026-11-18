@@ -155,6 +155,7 @@ class AnthropicSSEEmitter:
         self._cur_idx = 0
         self._tools: dict[str | int, dict[str, Any]] = {}
         self.had_content = False
+        self.had_output = False
         self.estimated_input = estimated_input
 
     def message_start(self) -> list[str]:
@@ -240,6 +241,7 @@ class AnthropicSSEEmitter:
 
     def text_delta(self, text: str) -> list[str]:
         self.had_content = True
+        self.had_output = True
         events: list[str] = []
         if not self._text_started:
             self._text_idx = self._cur_idx
@@ -287,6 +289,7 @@ class AnthropicSSEEmitter:
         t["name"] = name
         t["started"] = True
         self.had_content = True
+        self.had_output = True
         return [sse("content_block_start", {
             "type": "content_block_start",
             "index": t["block_idx"],

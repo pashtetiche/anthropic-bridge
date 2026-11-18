@@ -677,3 +677,124 @@ async def test_openrouter_recovers_from_empty_stream(
         and data["delta"].get("type") == "text_delta"
     ]
     assert "Recovered from empty stream" in "".join(text_deltas)
+
+
+@pytest.mark.asyncio
+async def test_openrouter_reasoning_only_stream_retries_and_errors_when_no_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class FakeResponse:
+        def __init__(self, status_code: int, chunks: list[str]):
+            self.status_code = status_code
+            self._chunks = chunks
+
+        async def aread(self) -> bytes:
+            return b""
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            for chunk in self._chunks:
+                yield chunk
+
+        async def __aenter__(self) -> "FakeResponse":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            return FakeResponse(
+                200,
+                [
+                    'data: {"choices":[{"index":0,"delta":{"reasoning":"Only thinking..."},"finish_reason":"length"}]}\n\n',
+                    "data: [DONE]\n\n",
+                ],
+            )
+
+    async def noop_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.httpx.AsyncClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.asyncio.sleep",
+        noop_sleep,
+    )
+
+    provider = OpenRouterProvider("openrouter/tencent/hy4-flash", "token")
+    events = await collect_events(
+        provider.handle(
+            {
+                "model": "openrouter/tencent/hy4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
+    )
+
+    assert attempts == 2
+    error_events = [data for event, data in events if event == "error"]
+    assert len(error_events) == 1
+    assert "reasoning tokens only" in error_events[0]["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_preserves_repeated_reasoning_text_chunks_and_details_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64
+    import json
+
+    chunks = [
+        'data: {"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"step\\n","index":0}]}}]}\n\n',
+        'data: {"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"step\\n","index":0}]}}]}\n\n',
+        'data: {"choices":[{"index":0,"delta":{"content":"Final answer"},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+    ]
+    monkeypatch.setattr(
+        "anthropic_bridge.providers.openrouter.client.httpx.AsyncClient",
+        fake_client_factory(chunks),
+    )
+
+    provider = OpenRouterProvider("openrouter/deepseek/deepseek-v4", "token")
+    events = await collect_events(
+        provider.handle(
+            {
+                "model": "openrouter/deepseek/deepseek-v4",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
+    )
+
+    thinking_deltas = [
+        data["delta"]["thinking"]
+        for event, data in events
+        if event == "content_block_delta"
+        and data["delta"].get("type") == "thinking_delta"
+    ]
+    assert "".join(thinking_deltas) == "step\nstep\n"
+
+    sig_deltas = [
+        data["delta"]["signature"]
+        for event, data in events
+        if event == "content_block_delta"
+        and data["delta"].get("type") == "signature_delta"
+    ]
+    assert len(sig_deltas) == 1
+    assert sig_deltas[0].startswith("or_rd:")
+    decoded = json.loads(base64.b64decode(sig_deltas[0][6:]).decode("utf-8"))
+    assert decoded == [{"type": "reasoning.text", "text": "step\nstep\n", "index": 0}]

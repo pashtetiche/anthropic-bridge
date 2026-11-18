@@ -290,7 +290,7 @@ class OpenRouterProvider:
     _inject_gemini_reasoning = _inject_cached_reasoning
 
     @staticmethod
-    def _merge_reasoning_details(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _merge_reasoning_details(details: list[Any]) -> list[dict[str, Any]]:
         if not details:
             return []
         merged: list[dict[str, Any]] = []
@@ -522,7 +522,7 @@ class OpenRouterProvider:
                                 delta = {}
 
                             if delta.get("reasoning_details"):
-                                self._append_unique_reasoning_details(
+                                self._append_stream_reasoning_details(
                                     current_reasoning_details, delta["reasoning_details"]
                                 )
 
@@ -540,14 +540,26 @@ class OpenRouterProvider:
                                 for _e in emitter.thinking_delta(reasoning):
                                     yield _e
                             else:
-                                # summary из reasoning_details только если плоского reasoning нет
+                                # summary/text из reasoning_details только если плоского reasoning нет
                                 # (openai дублирует контент в оба поля — избегаем двойного эмита)
                                 for rd in (delta.get("reasoning_details") or []):
-                                    if rd.get("type") == "reasoning.summary":
-                                        summary_delta = rd.get("summary") or ""
-                                        if summary_delta:
-                                            for _e in emitter.thinking_delta(summary_delta):
-                                                yield _e
+                                    if not isinstance(rd, dict):
+                                        continue
+                                    rd_type = rd.get("type")
+                                    if rd_type == "reasoning.summary":
+                                        rd_chunk = rd.get("summary") or ""
+                                    elif rd_type == "reasoning.text":
+                                        rd_chunk = rd.get("text") or ""
+                                    else:
+                                        rd_chunk = ""
+                                    if rd_chunk:
+                                        total_reasoning_chars += len(rd_chunk)
+                                        if len(sample_reasoning_chunks) < 8:
+                                            sample_reasoning_chunks.append(rd_chunk)
+                                        if ttft is None:
+                                            ttft = time.monotonic() - t0
+                                        for _e in emitter.thinking_delta(rd_chunk):
+                                            yield _e
 
                             if content:
                                 if emitter.thinking_started:
@@ -610,19 +622,28 @@ class OpenRouterProvider:
                                         cached_tool_ids.append(t["id"])
 
                     if (
-                        not emitter.had_content
+                        not emitter.had_output
                         and not emitter.has_tools
                         and not had_error
                         and empty_stream_retries < max_empty_stream_retries
                     ):
                         empty_stream_retries += 1
                         backoff = 1.0
+                        reason_label = (
+                            "[REASONING-ONLY STREAM] Upstream returned reasoning with 0 visible output tokens."
+                            if emitter.had_content
+                            else "[EMPTY STREAM] Upstream returned 0 content tokens."
+                        )
                         print(
-                            f"{log_timestamp()} [{self.target_model}] [EMPTY STREAM] Upstream returned 0 content tokens. "
+                            f"{log_timestamp()} [{self.target_model}] {reason_label} "
                             f"Retrying ({empty_stream_retries}/{max_empty_stream_retries}) after {backoff:.1f}s...",
                             file=sys.stderr,
                             flush=True,
                         )
+                        if emitter.thinking_started:
+                            prev_sig = self._pack_reasoning_signature(current_reasoning_details)
+                            for _e in emitter.close_thinking(signature=prev_sig):
+                                yield _e
                         current_reasoning_details.clear()
                         packed_sig_details_count = 0
                         total_reasoning_chars = 0
@@ -691,18 +712,23 @@ class OpenRouterProvider:
                 for _e in emitter.emit_redacted_thinking(redacted_data):
                     yield _e
 
-        if not emitter.had_content and not emitter.has_tools and not had_error:
+        if not emitter.had_output and not emitter.has_tools and not had_error:
+            err_msg = (
+                f"Model '{self.target_model}' returned reasoning tokens only without visible text or tool calls."
+                if emitter.had_content
+                else (
+                    f"No content received from OpenRouter API for model "
+                    f"'{self.target_model}'. The provider may be rate-limited "
+                    f"or the model may not be available."
+                )
+            )
             yield sse(
                 "error",
                 {
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": (
-                            f"No content received from OpenRouter API for model "
-                            f"'{self.target_model}'. The provider may be rate-limited "
-                            f"or the model may not be available."
-                        ),
+                        "message": err_msg,
                     },
                 },
             )
@@ -790,6 +816,27 @@ class OpenRouterProvider:
             "output_tokens": completion_t,
         }, signature=sig):
             yield _e
+
+    @staticmethod
+    def _append_stream_reasoning_details(
+        target: list[dict[str, Any]], details: list[Any]
+    ) -> None:
+        seen = {
+            json.dumps(item, sort_keys=True)
+            for item in target
+            if not (item.get("type") == "reasoning.text" and not item.get("signature"))
+        }
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "reasoning.text" and not item.get("signature"):
+                target.append(item)
+                continue
+            encoded = json.dumps(item, sort_keys=True)
+            if encoded in seen:
+                continue
+            target.append(item)
+            seen.add(encoded)
 
     @staticmethod
     def _append_unique_reasoning_details(

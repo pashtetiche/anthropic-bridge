@@ -298,3 +298,39 @@ def test_extract_client_reasoning_summary() -> None:
     assert extract_client_reasoning_summary({"thinking": {"type": "enabled", "budget_tokens": 5000}}) == "budget=5000"
     assert extract_client_reasoning_summary({"thinking": {"type": "adaptive"}}) == "adaptive"
     assert extract_client_reasoning_summary({"output_config": {"effort": "high"}}) == "effort=high"
+
+
+def test_setup_debug_log_file_creates_per_session_file_and_latest_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import sys
+
+    from anthropic_bridge.logging import (
+        is_debug_enabled,
+        reset_debug_log_file,
+        setup_debug_log_file,
+    )
+
+    reset_debug_log_file()
+    try:
+        monkeypatch.delenv("ANTHROPIC_BRIDGE_DEBUG", raising=False)
+        assert not is_debug_enabled()
+        assert setup_debug_log_file(tmp_path) is None
+
+        monkeypatch.setenv("ANTHROPIC_BRIDGE_DEBUG", "0")
+        assert not is_debug_enabled()
+
+        monkeypatch.setenv("ANTHROPIC_BRIDGE_DEBUG", "1")
+        assert is_debug_enabled()
+        log_path = setup_debug_log_file(tmp_path)
+        assert log_path is not None
+        assert log_path.exists()
+        assert (tmp_path / "anthropic-bridge-debug-latest.log").resolve() == log_path.resolve()
+
+        print("hello stderr probe", file=sys.stderr, flush=True)
+        print("hello stdout banner", flush=True)
+        content = log_path.read_text(encoding="utf-8")
+        assert "hello stderr probe" in content
+        assert "hello stdout banner" in content
+    finally:
+        reset_debug_log_file()

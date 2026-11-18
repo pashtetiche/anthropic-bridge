@@ -47,4 +47,24 @@ ANTHROPIC_BRIDGE_LIVE_TESTS=1 OPENROUTER_API_KEY=your_key pytest tests/test_inte
 **Caching & Reasoning Continuity**:
 - **Prompt Caching**: `transform.py` preserves `cache_control` breakpoints across `system`, `messages`, and `tools`. For Claude models on OpenRouter, 5-minute ephemeral caching (`cache_control: {"type": "ephemeral"}`) is enabled by default to trigger upstream prompt caching. Can be extended via `ANTHROPIC_CACHE_TTL=1h`.
 - **Reasoning Preservation (Preserved Thinking)**: Chain of Thought traces are preserved across agent tool steps and user turns. Outgoing reasoning is encoded into the Anthropic `thinking` block's `signature` (`or_rd:...`) and reconstructed on subsequent steps. `ReasoningCache` (`cache.py`) acts as a fallback keyed by `tool_call_id`.
-- **Debugging & Probe Logs**: Setting `ANTHROPIC_BRIDGE_DEBUG=1` enables granular `[PROBE ...]` logs showing thinking blocks and reasoning details traveling between Client, Bridge, and OpenRouter. All server and provider logs are timestamped at the beginning of each line (`YYYY-MM-DD HH:MM:SS`).
+- **Debugging & Probe Logs**: Setting `ANTHROPIC_BRIDGE_DEBUG=1` enables granular `[PROBE ...]` logs showing thinking blocks, `cache_control` breakpoints, and reasoning details traveling between Client, Bridge, and OpenRouter. Each bridge startup in debug mode also tees all stdout/stderr/uvicorn logs to a fresh per-session file `/tmp/anthropic-bridge-debug-<YYYYmmdd-HHMMSS>-pid<pid>.log` and updates `/tmp/anthropic-bridge-debug-latest.log` (override directory via `ANTHROPIC_BRIDGE_DEBUG_DIR`). All server and provider logs are timestamped at the beginning of each line (`YYYY-MM-DD HH:MM:SS`).
+
+## Autonomous Debugging via Claude Code
+
+Agents can reproduce and verify Claude Code client behavior, caching, subagents, and auto-mode verifiers without manual user clicks:
+
+1. **Isolate sandbox & server**:
+   - Use a temporary workspace (e.g., `/tmp/cc_sandbox`) with a dummy `CLAUDE.md` marker and test file; remove all `/tmp` artifacts when done.
+   - If running your own mock or test bridge instance, bind an unused port (e.g., `18085`), manage its lifecycle in a `try/finally` block, and verify with `ps` that no stray process remains. Do not kill or spam the user's running bridge unless asked.
+   - If live upstream calls are needed and `OPENROUTER_API_KEY` is not in the shell environment (do not read secret files like `~/.envrc.private`), either test protocol/transform behavior with a local mock responder or ask the user to start/restart their debug bridge and read `/tmp/anthropic-bridge-debug-latest.log`.
+
+2. **Drive `claude` headlessly (`-p`)**:
+   - Basic tool-loop + multi-turn resume:
+     `ANTHROPIC_BASE_URL=http://127.0.0.1:<port> ANTHROPIC_API_KEY=dummy claude -p --model <model> --output-format json --permission-mode bypassPermissions --setting-sources project "<prompt>"`
+     Extract `session_id` from JSON output and pass `--resume <session_id>` for cross-turn verification.
+   - Subagent & Auto-Mode verifier testing:
+     Set `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_AUTO_MODE_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` in the subprocess env, use `--permission-mode auto`, and prompt a mutating `Bash` command (read-only commands like `ls` fast-path past the classifier) or an `Agent` call (`Explore` vs `general-purpose`).
+
+3. **Verify in debug logs**:
+   - Check `/tmp/anthropic-bridge-debug-latest.log` for `[PROBE Client -> Bridge]`, `[PROBE ReasoningCache -> OpenRouter]`, `[PROBE Bridge -> OpenRouter]`, `[PROBE OpenRouter -> Bridge]`, and the final `in ... | cached ... | out ... | reason ...` summary line.
+   - Note that Claude Code's built-in `Explore` subagent intentionally omits `CLAUDE.md` and full system instructions, whereas `general-purpose` includes `CLAUDE.md`. Also note that Auto-Mode classifier calls are single-turn (`[user, user]` without an `assistant` turn), so models whose upstream KV cache requires multi-turn `assistant` history (e.g., `tencent/hy4-flash`) will report `0%` cache hits in `CLAUDE_CODE_AUTO_MODE_MODEL`.

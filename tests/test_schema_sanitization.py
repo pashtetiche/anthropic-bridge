@@ -270,3 +270,59 @@ def test_convert_anthropic_messages_redacted_thinking_or_rd():
     assert converted[1]["role"] == "assistant"
     assert converted[1]["content"] is None
     assert converted[1]["reasoning_details"] == encrypted
+
+
+def test_convert_anthropic_messages_preserves_cache_control_on_in_conversation_system():
+    from anthropic_bridge.transform import convert_anthropic_messages_to_openai
+
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "# Environment\nCWD: /tmp",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+    ]
+
+    converted = convert_anthropic_messages_to_openai(messages)
+    assert len(converted) == 2
+    assert converted[1] == {
+        "role": "system",
+        "content": [
+            {
+                "type": "text",
+                "text": "# Environment\nCWD: /tmp",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+    }
+
+
+def test_convert_anthropic_messages_strips_billing_header_from_system():
+    from anthropic_bridge.transform import (
+        convert_anthropic_messages_to_openai,
+        normalize_system_message,
+    )
+
+    system = [
+        {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.327.abc; cc_entrypoint=sdk-cli;"},
+        {"type": "text", "text": "Actual instructions", "cache_control": {"type": "ephemeral"}},
+    ]
+    converted = convert_anthropic_messages_to_openai(
+        [{"role": "user", "content": "Hi"}],
+        system=system,
+    )
+    assert converted[0] == {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "Actual instructions", "cache_control": {"type": "ephemeral"}}
+        ],
+    }
+    assert normalize_system_message(system) == "Actual instructions"
+    assert normalize_system_message("x-anthropic-billing-header: cc_version=1.0;\nActual") == "Actual"
+    assert normalize_system_message([system[0]]) is None

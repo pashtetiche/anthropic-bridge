@@ -2,8 +2,11 @@ import collections
 import copy
 import logging
 import os
+import sys
+import threading
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, TextIO, cast
 
 from uvicorn.config import LOGGING_CONFIG
 from uvicorn.logging import AccessFormatter
@@ -21,7 +24,126 @@ def log_timestamp() -> str:
 
 
 def is_debug_enabled() -> bool:
-    return bool(os.environ.get("ANTHROPIC_BRIDGE_DEBUG"))
+    val = os.environ.get("ANTHROPIC_BRIDGE_DEBUG", "").strip().lower()
+    return val not in ("", "0", "false", "no", "off")
+
+
+class _TeeTextStream:
+    """Forwards writes to both the original stream and a per-session debug file."""
+
+    def __init__(self, primary: TextIO, log_file: TextIO, lock: threading.Lock):
+        self._primary = primary
+        self._log_file = log_file
+        self._lock = lock
+        self.encoding: str = getattr(primary, "encoding", "utf-8") or "utf-8"
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._primary.isatty())
+        except Exception:
+            return False
+
+    def fileno(self) -> int:
+        return self._primary.fileno()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        with self._lock:
+            n = self._primary.write(s)
+            try:
+                self._log_file.write(s)
+            except Exception:
+                pass
+            return n
+
+    def writelines(self, lines: Any) -> None:
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._primary.flush()
+            try:
+                self._log_file.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._primary, name)
+
+
+_active_debug_log_path: Path | None = None
+_active_debug_file: TextIO | None = None
+
+
+def get_debug_log_path() -> Path | None:
+    return _active_debug_log_path
+
+
+def reset_debug_log_file() -> None:
+    """Restore stdout/stderr and close active debug file (primarily for tests)."""
+    global _active_debug_log_path, _active_debug_file
+    if isinstance(sys.stderr, _TeeTextStream):
+        sys.stderr = sys.stderr._primary
+    if isinstance(sys.stdout, _TeeTextStream):
+        sys.stdout = sys.stdout._primary
+    if _active_debug_file is not None:
+        try:
+            _active_debug_file.close()
+        except Exception:
+            pass
+    _active_debug_log_path = None
+    _active_debug_file = None
+
+
+def setup_debug_log_file(log_dir: Path | str | None = None) -> Path | None:
+    """Create a fresh per-session debug log in /tmp when ANTHROPIC_BRIDGE_DEBUG is enabled."""
+    global _active_debug_log_path, _active_debug_file
+
+    if not is_debug_enabled():
+        return None
+    if _active_debug_log_path is not None:
+        return _active_debug_log_path
+
+    base_dir = Path(
+        log_dir
+        or os.environ.get("ANTHROPIC_BRIDGE_DEBUG_DIR")
+        or "/tmp"
+    )
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log_path = base_dir / f"anthropic-bridge-debug-{stamp}-pid{os.getpid()}.log"
+    log_file = log_path.open("w", encoding="utf-8", buffering=1)
+
+    latest_link = base_dir / "anthropic-bridge-debug-latest.log"
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(log_path)
+    except OSError:
+        pass
+
+    lock = threading.Lock()
+    orig_stderr = sys.stderr
+    orig_stdout = sys.stdout
+    tee_stderr = cast(TextIO, _TeeTextStream(orig_stderr, log_file, lock))
+    tee_stdout = cast(TextIO, _TeeTextStream(orig_stdout, log_file, lock))
+
+    sys.stderr = tee_stderr
+    sys.stdout = tee_stdout
+
+    for logger_name in ("", "uvicorn", "uvicorn.access", "uvicorn.error"):
+        logger = logging.getLogger(logger_name)
+        for handler in logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and handler.stream is orig_stderr:
+                handler.setStream(tee_stderr)
+
+    _active_debug_log_path = log_path
+    _active_debug_file = log_file
+    return log_path
 
 
 def extract_client_reasoning_summary(payload: dict[str, Any]) -> str:

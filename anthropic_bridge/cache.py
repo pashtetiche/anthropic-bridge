@@ -5,7 +5,7 @@ from threading import Lock
 from typing import Any
 
 DEFAULT_CACHE_DIR = Path.home() / ".anthropic_bridge" / "cache"
-DEFAULT_TTL_DAYS = 30
+DEFAULT_TTL_DAYS = 7
 
 
 class ReasoningCache:
