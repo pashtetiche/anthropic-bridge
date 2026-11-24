@@ -326,3 +326,54 @@ def test_convert_anthropic_messages_strips_billing_header_from_system():
     assert normalize_system_message(system) == "Actual instructions"
     assert normalize_system_message("x-anthropic-billing-header: cc_version=1.0;\nActual") == "Actual"
     assert normalize_system_message([system[0]]) is None
+
+
+def test_in_conversation_system_preserves_non_text_blocks_when_cache_control_moves():
+    from anthropic_bridge.transform import (
+        convert_anthropic_messages_to_openai,
+        extract_text_content,
+    )
+
+    tool_addition = {
+        "type": "tool_addition",
+        "tool": {"type": "tool_definition", "definition": {"name": "mcp__docs__update"}},
+    }
+
+    step1 = [
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Hook text"},
+                {**tool_addition, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ],
+        },
+    ]
+    step2 = [
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Hook text"},
+                tool_addition,
+            ],
+        },
+    ]
+
+    out1 = convert_anthropic_messages_to_openai(step1)
+    out2 = convert_anthropic_messages_to_openai(step2)
+
+    assert isinstance(out1[1]["content"], list)
+    assert isinstance(out2[1]["content"], list)
+    assert len(out1[1]["content"]) == 2
+    assert len(out2[1]["content"]) == 2
+    assert out1[1]["content"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in out2[1]["content"][1]
+    assert "cache_control" not in out1[1]["content"][1]["text"]
+    assert [b["text"] for b in out1[1]["content"]] == [b["text"] for b in out2[1]["content"]]
+
+    # extract_text_content(list) also preserves non-text blocks without leaking cache_control
+    flat = extract_text_content(step1[1]["content"])
+    assert "Hook text" in flat
+    assert "mcp__docs__update" in flat
+    assert "cache_control" not in flat

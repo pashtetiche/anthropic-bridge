@@ -82,10 +82,13 @@ def extract_text_content(content: Any) -> str:
             if isinstance(block, str):
                 text_parts.append(block)
             elif isinstance(block, dict):
-                if block.get("type") == "text" and block.get("text"):
-                    text_parts.append(block["text"])
+                if block.get("type") == "text":
+                    if block.get("text"):
+                        text_parts.append(block["text"])
                 elif block.get("content"):
                     text_parts.append(extract_text_content(block["content"]))
+                else:
+                    text_parts.append(extract_text_content(block))
         return "\n".join(text_parts)
 
     if isinstance(content, dict):
@@ -93,6 +96,8 @@ def extract_text_content(content: Any) -> str:
             return str(content["text"])
         elif content.get("content"):
             return extract_text_content(content["content"])
+        cleaned = {k: v for k, v in content.items() if k != "cache_control"}
+        return json.dumps(cleaned)
 
     return json.dumps(content)
 
@@ -399,9 +404,7 @@ def convert_anthropic_messages_to_openai(
 
         elif role == "system":
             sys_msg: dict[str, Any] = {"role": "system"}
-            if isinstance(content, list) and any(
-                isinstance(b, dict) and "cache_control" in b for b in content
-            ):
+            if isinstance(content, list):
                 sys_blocks: list[dict[str, Any]] = []
                 for item in content:
                     if isinstance(item, dict):
