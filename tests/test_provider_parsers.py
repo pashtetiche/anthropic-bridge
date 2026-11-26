@@ -321,28 +321,35 @@ async def test_openrouter_emits_redacted_thinking_for_trailing_encrypted_reasoni
         )
     )
 
-    redacted_blocks = [
+    thinking_blocks = [
         data["content_block"]
         for event, data in events
         if event == "content_block_start"
-        and data["content_block"].get("type") == "redacted_thinking"
+        and data["content_block"].get("type") == "thinking"
     ]
-    assert len(redacted_blocks) == 1
-    assert redacted_blocks[0]["data"].startswith("or_rd:")
+    sig_deltas = [
+        data["delta"]["signature"]
+        for event, data in events
+        if event == "content_block_delta"
+        and data["delta"].get("type") == "signature_delta"
+    ]
+    assert len(thinking_blocks) == 1
+    assert len(sig_deltas) == 1
+    assert sig_deltas[0].startswith("or_rd:")
 
-    # Ensure open text block is stopped before redacted_thinking starts
+    # Ensure open text block is stopped before trailing thinking starts
     stop_indices = [
         (i, data["index"])
         for i, (event, data) in enumerate(events)
         if event == "content_block_stop"
     ]
-    redacted_start_pos = next(
+    thinking_start_pos = next(
         i
         for i, (event, data) in enumerate(events)
         if event == "content_block_start"
-        and data["content_block"].get("type") == "redacted_thinking"
+        and data["content_block"].get("type") == "thinking"
     )
-    assert any(pos < redacted_start_pos and idx == 0 for pos, idx in stop_indices)
+    assert any(pos < thinking_start_pos and idx == 0 for pos, idx in stop_indices)
 
 
 @pytest.mark.asyncio

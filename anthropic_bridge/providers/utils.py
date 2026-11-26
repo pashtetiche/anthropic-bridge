@@ -216,18 +216,31 @@ class AnthropicSSEEmitter:
         ]
 
     def emit_redacted_thinking(self, data: str) -> list[str]:
-        """Emit a standalone redacted_thinking block carrying opaque encrypted reasoning."""
+        """Emit a standalone thinking block carrying only an opaque signature.
+
+        Emits ``type: "thinking"`` with ``signature_delta`` instead of
+        ``type: "redacted_thinking"`` because Claude Code's VSCode webview
+        renders ``redacted_thinking`` as ``Unsupported content type: redacted_thinking``,
+        while ``transform.py`` extracts ``or_rd:...`` from ``thinking.signature``.
+        """
         if not data:
             return []
         self.had_content = True
         events = self.close_text()
+        for key in list(self._tools):
+            events.extend(self.close_tool(key))
         idx = self._cur_idx
         self._cur_idx += 1
         events.extend([
             sse("content_block_start", {
                 "type": "content_block_start",
                 "index": idx,
-                "content_block": {"type": "redacted_thinking", "data": data},
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            }),
+            sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "signature_delta", "signature": data},
             }),
             sse("content_block_stop", {
                 "type": "content_block_stop",
